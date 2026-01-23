@@ -19,7 +19,7 @@ Using on the command line as a script
 
     main.py -h <dcm1 ip address> [-p <port> -s <zone_id> -z <zone_id> -i <source_id> -a -l]
 	    -h hostname or ip		Hostname or IP of the DCM1 - required
-	    -p port			Port of the DCM1 to connect to - defaults to 23
+	    -p port			Port of the DCM1 to connect to - defaults to 4999
 	    -z zone_id -i source_id	Set zone ID to use source ID - specified as an int e.g. -i 2 -z 4 both must be specified
 	    -s zone_id	        Display the source for this zone ID must be an int e.g. 2
 	    -a				Display the source for all zones
@@ -27,23 +27,23 @@ Using on the command line as a script
 
 Log out the source used on a specific zone and exit
 
-    python3 main.py -h 192.168.1.100 -s 02
+    python3 main.py -h 192.168.1.139 -s 02
 
 Log out all source/zone mappings and exit
 
-    python3 main.py -h 192.168.1.100 -a
+    python3 main.py -h 192.168.1.139 -a
 
 Change zone id 2 to source 3 and exit
 
-    python3 main.py -h 192.168.1.100 -z 2 -i 3
+    python3 main.py -h 192.168.1.139 -z 2 -i 3
 
 Run forever logging status changes
 
-    python3 main.py -h 192.168.1.100 -l
+    python3 main.py -h 192.168.1.139 -l
 
 Change a source then run forever logging status changes
 
-    python3 main.py -h 192.168.1.100 -z 2 -i 3 -l
+    python3 main.py -h 192.168.1.139 -z 2 -i 3 -l
 
 
 Using in an application

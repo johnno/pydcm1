@@ -12,7 +12,7 @@ if __name__ == "__main__":
     # Example structure (to be implemented):
     # from pydcm1.mixer import DCM1Mixer
     # 
-    # mixer = DCM1Mixer("192.168.1.100", 23)
+    # mixer = DCM1Mixer("192.168.1.139", 4999)
     # await mixer.async_connect()
     # await mixer.set_zone_source(zone_id=1, source_id=2)
     # mixer.close()

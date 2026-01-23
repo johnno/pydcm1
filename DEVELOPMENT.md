@@ -31,5 +31,5 @@ python -m pytest
 Run manual tests with your DCM1:
 
 ```bash
-python main.py -h <your-dcm1-ip> -a
+python main.py -h 192.168.1.139 -a
 ```

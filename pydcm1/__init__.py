@@ -1,5 +1,9 @@
-# pydcm1 Python Package
+"""pydcm1 Python Package
 
-Empty __init__.py for pydcm1 package.
+Python library for controlling Cloud DCM1 Zone Mixer.
+"""
 
-The actual implementation modules will be added here as development progresses.
+from pydcm1.mixer import DCM1Mixer
+
+__all__ = ["DCM1Mixer"]
+
