@@ -27,6 +27,10 @@ pip-log.txt
 pip-delete-this-directory.txt
 .tox/
 .nox/
+venv/
+env/
+ENV/
+.venv/
 .coverage
 .coverage.*
 .cache
