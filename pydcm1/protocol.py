@@ -427,6 +427,44 @@ class MixerProtocol(asyncio.Protocol):
         self._logger.info(f"Queueing command: {command.encode()}")
         self._data_send_persistent(command)
 
+    def send_volume_level(self, zone_id: int, level):
+        """Set volume level for a zone.
+        
+        Args:
+            zone_id: Zone ID (1-8)
+            level: Volume level - int (0-61 where 20 = -20dB, 62 for mute) or "mute"
+        """
+        self._logger.info(
+            f"Setting volume level - Zone: {zone_id} to level: {level}"
+        )
+        # DCM1 uses <ZX.MU,LN/> to set zone X to level N
+        # Example: <Z4.MU,L21/> sets zone 4 to -21dB
+        # Level 62 is mute: <Z4.MU,L62/> mutes zone 4
+        # Response: <z4.mu,l=21/> or <z4.mu,l=mute/>
+        if not (1 <= zone_id <= self._zone_count):
+            self._logger.error(f"Invalid zone_id {zone_id}, must be 1-{self._zone_count}")
+            return
+        
+        # Validate level
+        if isinstance(level, str):
+            if level.lower() != "mute":
+                self._logger.error(f"Invalid level string '{level}', must be 'mute' or integer 0-62")
+                return
+            level_str = "62"  # Mute is level 62
+        elif isinstance(level, int):
+            if not (0 <= level <= 62):
+                self._logger.error(f"Invalid level {level}, must be 0-62 (62=mute)")
+                return
+            level_str = str(level)
+        else:
+            self._logger.error(f"Invalid level type {type(level)}, must be int or 'mute'")
+            return
+        
+        # Set the volume level on this zone
+        command = f"<Z{zone_id}.MU,L{level_str}/>\r"
+        self._logger.info(f"Queueing command: {command.encode()}")
+        self._data_send_persistent(command)
+
     def send_zone_source_query_messages(self):
         self._logger.info(f"Sending status query messages for all zones")
         # DCM1 uses <ZX.MU,SQ/> to query which source is active on zone X

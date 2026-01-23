@@ -77,6 +77,37 @@ async def set_source(hostname: str, port: int, zone_id: int, source_id: int):
     print("Done")
 
 
+async def set_volume(hostname: str, port: int, zone_id: int, level):
+    """Set volume level for a zone."""
+    print(f"Connecting to DCM1 at {hostname}:{port}...")
+    
+    mixer = DCM1Mixer(hostname, port)
+    await mixer.async_connect()
+    
+    # Wait a bit for connection to establish
+    await asyncio.sleep(1)
+    
+    if level.lower() == "mute":
+        print(f"Muting Zone {zone_id}...")
+        mixer.set_volume(zone_id, "mute")
+    else:
+        try:
+            level_int = int(level)
+            db_value = -level_int
+            print(f"Setting Zone {zone_id} to {db_value}dB (level {level_int})...")
+            mixer.set_volume(zone_id, level_int)
+        except ValueError:
+            print(f"Error: Invalid level '{level}'. Use 0-61 or 'mute'")
+            mixer.close()
+            return
+    
+    # Wait for command to be processed and sent
+    await asyncio.sleep(3)
+    
+    mixer.close()
+    print("Done")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Control Cloud DCM1 Zone Mixer")
     parser.add_argument("--host", default="192.168.1.139", help="DCM1 hostname or IP (default: 192.168.1.139)")
@@ -92,6 +123,11 @@ def main():
     set_parser.add_argument("zone", type=int, help="Zone ID (1-8)")
     set_parser.add_argument("source", type=int, help="Source ID (1-8)")
     
+    # Volume command
+    volume_parser = subparsers.add_parser("volume", help="Set volume level for a zone")
+    volume_parser.add_argument("zone", type=int, help="Zone ID (1-8)")
+    volume_parser.add_argument("level", help="Volume level (0-61 where 20=-20dB, 62=mute, or 'mute')")
+    
     args = parser.parse_args()
     
     # Always enable debug logging for now
@@ -101,6 +137,8 @@ def main():
         asyncio.run(show_status(args.host, args.port))
     elif args.command == "set":
         asyncio.run(set_source(args.host, args.port, args.zone, args.source))
+    elif args.command == "volume":
+        asyncio.run(set_volume(args.host, args.port, args.zone, args.level))
     else:
         parser.print_help()
 

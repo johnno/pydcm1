@@ -112,6 +112,15 @@ class DCM1Mixer:
         """Set a zone to use a specific source."""
         self.protocol.send_change_source(source_id, zone_id)
 
+    def set_volume(self, zone_id: int, level):
+        """Set volume level for a zone.
+        
+        Args:
+            zone_id: Zone ID (1-8)
+            level: Volume level - int (0-61 where 20 = -20dB, 62 for mute) or "mute"
+        """
+        self.protocol.send_volume_level(zone_id, level)
+
     def change_source(self, source_id: int, zone_id: int):
         self.protocol.send_change_source(source_id, zone_id)
 
