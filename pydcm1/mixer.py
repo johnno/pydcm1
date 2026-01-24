@@ -90,6 +90,11 @@ class ZoneLabelListener(SourceChangeListener):
         # Protocol only calls this when all 8 line inputs are received
         self._mixer._groups_line_inputs_received.add(group_id)
     
+    def group_source_changed(self, group_id: int, source_id: int):
+        """Track when a group's source changes."""
+        # Just track that we received this - don't need to do anything else
+        pass
+    
     def volume_level_changed(self, zone_id: int, level):
         pass
     
