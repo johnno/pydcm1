@@ -65,7 +65,7 @@ class MixerProtocol(asyncio.Protocol):
         hostname,
         port,
         callback: SourceChangeListener,
-        heartbeat_time=60,
+        heartbeat_time=10,
         reconnect_time=10,
         enable_heartbeat=True,
         command_confirmation=True,
