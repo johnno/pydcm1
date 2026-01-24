@@ -139,6 +139,25 @@ class DCM1Mixer:
     def status_of_all_zones(self) -> list[tuple[int, Optional[int]]]:
         return self.protocol.get_status_of_all_zones()
 
+    def get_enabled_line_inputs(self, zone_id: int) -> dict[int, bool]:
+        """Get which line inputs are enabled for a zone.
+        
+        Args:
+            zone_id: Zone ID (1-8)
+            
+        Returns:
+            Dictionary mapping line input ID (1-8) to enabled status (True/False)
+        """
+        return self.protocol.get_enabled_line_inputs(zone_id)
+
+    def query_line_inputs(self, zone_id: int):
+        """Query which line inputs are enabled for a zone.
+        
+        Args:
+            zone_id: Zone ID (1-8)
+        """
+        self.protocol.send_line_input_enable_query_messages(zone_id)
+
     def send_volume_up(self, zone_id: int):
         """Send volume up command to a zone."""
         self.protocol.send_volume_up(zone_id)

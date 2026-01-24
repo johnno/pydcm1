@@ -23,14 +23,22 @@ async def show_status(hostname: str, port: int):
     print("Querying zone labels, source labels, volume levels, and status...")
     await asyncio.sleep(5)
     
+    # Query line input enables for all zones
+    for zone_id in range(1, 9):
+        mixer.query_line_inputs(zone_id)
+    
+    # Wait for line input queries to complete (8 zones * 8 lines * 0.1s)
+    await asyncio.sleep(7)
+    
     print("\nZone Status:")
-    print("-" * 60)
+    print("-" * 100)
     
     for zone_id in range(1, 9):
         zone = mixer.zones_by_id.get(zone_id)
         if zone:
             source_id = mixer.protocol.get_status_of_zone(zone_id)
             volume = mixer.protocol.get_volume_level(zone_id)
+            enabled_inputs = mixer.get_enabled_line_inputs(zone_id)
             
             # Format volume display
             if volume == "mute":
@@ -42,18 +50,25 @@ async def show_status(hostname: str, port: int):
             else:
                 volume_str = "unknown"
             
+            # Format enabled inputs
+            if enabled_inputs:
+                enabled_list = [str(line_id) for line_id, enabled in sorted(enabled_inputs.items()) if enabled]
+                inputs_str = ",".join(enabled_list) if enabled_list else "none"
+            else:
+                inputs_str = "querying..."
+            
             if source_id:
                 source = mixer.sources_by_id.get(source_id)
                 source_name = source.name if source else f"Source {source_id}"
                 zone_label = f"Zone {zone_id} ({zone.name}):"
-                print(f"{zone_label:30s} {source_id} - {source_name:20s} | Vol: {volume_str}")
+                print(f"{zone_label:30s} {source_id} - {source_name:20s} | Vol: {volume_str:10s} | Inputs: {inputs_str}")
             else:
                 zone_label = f"Zone {zone_id} ({zone.name}):"
-                print(f"{zone_label:30s} {'OFF':24s} | Vol: {volume_str}")
+                print(f"{zone_label:30s} {'OFF':24s} | Vol: {volume_str:10s} | Inputs: {inputs_str}")
         else:
             print(f"Zone {zone_id}: Not configured")
     
-    print("-" * 40)
+    print("-" * 100)
     mixer.close()
 
 

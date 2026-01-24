@@ -28,6 +28,9 @@ SOURCE_LABEL_RESPONSE = re.compile(r"<l(\d+),lq(.*)/>", re.IGNORECASE)
 # Zone volume level response: <z1.mu,l=20/> or <z1.mu,l=mute/>
 ZONE_VOLUME_LEVEL_RESPONSE = re.compile(r"<z(\d+)\.mu,l=([^/]+)/>", re.IGNORECASE)
 
+# Line input enable response: <z1.l1,q=e, pri = off/> where q=e is enabled, q=d is disabled
+LINE_INPUT_ENABLE_RESPONSE = re.compile(r"<z(\d+)\.l(\d+),q=([ed]),", re.IGNORECASE)
+
 
 class MixerProtocol(asyncio.Protocol):
     _received_message: str
@@ -63,6 +66,7 @@ class MixerProtocol(asyncio.Protocol):
         self._received_message = ""
         self._zone_to_source_map = {}
         self._zone_to_volume_map = {}  # Maps zone_id to volume level (int or "mute")
+        self._zone_line_inputs_map = {}  # Maps zone_id to dict of line_id: enabled_bool
         # DCM1 has 8 zones and 8 line sources (hardcoded)
         self._zone_count: int = 8
         self._source_count: int = 8
@@ -392,6 +396,19 @@ class MixerProtocol(asyncio.Protocol):
             self._source_change_callback.volume_level_changed(zone_id, level)
             return
 
+        # Line input enable response: <z1.l1,q=e, pri = off/>
+        line_input_match = LINE_INPUT_ENABLE_RESPONSE.match(message)
+        if line_input_match:
+            self._logger.debug(f"Line input enable response received: {message}")
+            zone_id = int(line_input_match.group(1))
+            line_id = int(line_input_match.group(2))
+            enabled = line_input_match.group(3).lower() == 'e'
+            
+            if zone_id not in self._zone_line_inputs_map:
+                self._zone_line_inputs_map[zone_id] = {}
+            self._zone_line_inputs_map[zone_id][line_id] = enabled
+            return
+
         # System info response
         system_info_match = SYSTEM_INFO.match(message)
         if system_info_match:
@@ -494,12 +511,32 @@ class MixerProtocol(asyncio.Protocol):
         for zone_id in range(1, self._zone_count + 1):
             self._data_send_persistent(f"<Z{zone_id}.MU,LQ/>\r")
 
+    def send_line_input_enable_query_messages(self, zone_id: int):
+        """Query which line inputs are enabled for a specific zone.
+        
+        Args:
+            zone_id: Zone ID (1-8)
+        """
+        self._logger.info(f"Querying line input enables for zone {zone_id}")
+        # DCM1 uses <ZX.LY,Q/> to query if line input Y is enabled for zone X
+        # Response: <zX.lY,q=e, pri = off/> where q=e means enabled, q=d means disabled
+        for line_id in range(1, self._source_count + 1):
+            self._data_send_persistent(f"<Z{zone_id}.L{line_id},Q/>\r")
+
     def get_status_of_zone(self, zone_id: int) -> Optional[int]:
         return self._zone_to_source_map.get(zone_id, None)
 
     def get_volume_level(self, zone_id: int):
         """Get volume level for a zone. Returns int (0-61) or 'mute'."""
         return self._zone_to_volume_map.get(zone_id, None)
+
+    def get_enabled_line_inputs(self, zone_id: int) -> dict[int, bool]:
+        """Get which line inputs are enabled for a zone.
+        
+        Returns:
+            Dictionary mapping line input ID (1-8) to enabled status (True/False)
+        """
+        return self._zone_line_inputs_map.get(zone_id, {}).copy()
 
     def get_status_of_all_zones(self) -> list[tuple[int, Optional[int]]]:
         return_list: list[tuple[int, int | None]] = []
