@@ -35,6 +35,19 @@ ZONE_VOLUME_LEVEL_RESPONSE = re.compile(r"<z(\d+)\.mu,l=([^/]+)/>", re.IGNORECAS
 # Line input enable response: <z1.l1,q=e, pri = off/> where q=e is enabled, q=d is disabled
 LINE_INPUT_ENABLE_RESPONSE = re.compile(r"<z(\d+)\.l(\d+),q=([ed]),", re.IGNORECASE)
 
+# Group label response: <g1,lqMainBar+Snug/>
+GROUP_LABEL_RESPONSE = re.compile(r"<g(\d+),lq(.*)/>", re.IGNORECASE)
+
+# Group enable status response: <g1,q=1,3d/> or <g1,q=empty/> or <g1,q=2d/>
+# Format: q=<zone_list><d|e> where d=disabled, e=enabled
+# "empty" means no zones assigned and disabled
+# "1,3d" means zones 1 and 3 are assigned but group is disabled
+# "1,3" or "1,3e" means zones 1 and 3 are assigned and group is enabled
+GROUP_ENABLE_RESPONSE = re.compile(r"<g(\d+),q=([^/]+)/>", re.IGNORECASE)
+
+# Group line input enable response: <g1.l1,q=e, pri = off/> where q=e is enabled, q=d is disabled
+GROUP_LINE_INPUT_ENABLE_RESPONSE = re.compile(r"<g(\d+)\.l(\d+),q=([ed]),", re.IGNORECASE)
+
 
 class MixerProtocol(asyncio.Protocol):
     _received_message: str
@@ -71,6 +84,7 @@ class MixerProtocol(asyncio.Protocol):
         self._zone_to_source_map = {}
         self._zone_to_volume_map = {}  # Maps zone_id to volume level (int or "mute")
         self._zone_line_inputs_map = {}  # Maps zone_id to dict of line_id: enabled_bool
+        self._group_line_inputs_map = {}  # Maps group_id to dict of line_id: enabled_bool
         # DCM1 has 8 zones and 8 line sources (hardcoded)
         self._zone_count: int = 8
         self._source_count: int = 8
@@ -322,6 +336,67 @@ class MixerProtocol(asyncio.Protocol):
             # Could store firmware/hardware versions if needed
             return
 
+        # Group label response: <g1,lqMainBar+Snug/>
+        group_label_match = GROUP_LABEL_RESPONSE.match(message)
+        if group_label_match:
+            self._logger.debug(f"Group label response received: {message}")
+            group_id = int(group_label_match.group(1))
+            label = group_label_match.group(2)
+            self._source_change_callback.group_label_changed(group_id, label)
+            return
+
+        # Group enable status response: <g1,q=1,3d/> or <g1,q=empty/>
+        group_enable_match = GROUP_ENABLE_RESPONSE.match(message)
+        if group_enable_match:
+            self._logger.debug(f"Group enable status response received: {message}")
+            group_id = int(group_enable_match.group(1))
+            status_str = group_enable_match.group(2).strip()
+            # Parse status - "empty" means disabled, zone list can end with 'd' or 'e' or neither
+            enabled = False
+            zones = []
+            if status_str.lower() != "empty":
+                # Check if ends with 'd' or 'e'
+                if status_str.endswith('d'):
+                    enabled = False
+                    zone_list = status_str[:-1]  # Remove 'd'
+                elif status_str.endswith('e'):
+                    enabled = True
+                    zone_list = status_str[:-1]  # Remove 'e'
+                else:
+                    # No explicit enable/disable marker, assume enabled if has zones
+                    enabled = True
+                    zone_list = status_str
+                
+                # Parse zone list (e.g., "1,3" -> [1, 3])
+                if zone_list:
+                    try:
+                        zones = [int(z.strip()) for z in zone_list.split(',') if z.strip()]
+                    except ValueError:
+                        self._logger.warning(f"Invalid zone list in group status: {status_str}")
+            
+            self._source_change_callback.group_status_changed(group_id, enabled, zones)
+            return
+
+        # Group line input enable response: <g1.l1,q=e, pri = off/>
+        group_line_input_match = GROUP_LINE_INPUT_ENABLE_RESPONSE.match(message)
+        if group_line_input_match:
+            self._logger.debug(f"Group line input enable response received: {message}")
+            group_id = int(group_line_input_match.group(1))
+            line_id = int(group_line_input_match.group(2))
+            enabled = group_line_input_match.group(3).lower() == 'e'
+            
+            if group_id not in self._group_line_inputs_map:
+                self._group_line_inputs_map[group_id] = {}
+            self._group_line_inputs_map[group_id][line_id] = enabled
+            
+            # Check if we've received all 8 line inputs for this group
+            if len(self._group_line_inputs_map[group_id]) == 8:
+                # Notify listener with complete set
+                self._source_change_callback.group_line_inputs_changed(
+                    group_id, self._group_line_inputs_map[group_id].copy()
+                )
+            return
+
         self._logger.debug(f"Unhandled message received: {message}")
 
     def _process_source_changed(self, source_id, zone_id):
@@ -438,6 +513,30 @@ class MixerProtocol(asyncio.Protocol):
         for line_id in range(1, self._source_count + 1):
             self._data_send_persistent(f"<Z{zone_id}.L{line_id},Q/>\r")
 
+    def send_group_line_input_enable_query_messages(self, group_id: int):
+        """Query which line inputs are enabled for a specific group.
+        
+        Args:
+            group_id: Group ID (1-4)
+        """
+        self._logger.info(f"Querying line input enables for group {group_id}")
+        # DCM1 uses <GX.LY,Q/> to query if line input Y is enabled for group X
+        # Response: <gX.lY,q=e, pri = off/> where q=e means enabled, q=d means disabled
+        for line_id in range(1, self._source_count + 1):
+            self._data_send_persistent(f"<G{group_id}.L{line_id},Q/>\r", PRIORITY_HEARTBEAT)
+
+    def send_all_group_queries(self):
+        """Query labels, status, and line inputs for all 4 groups."""
+        self._logger.info("Querying all group labels, statuses, and line inputs")
+        for group_id in range(1, 5):  # DCM1 has 4 groups (G1-G4)
+            # Query group label: <G1,LQ/>
+            self._data_send_persistent(f"<G{group_id},LQ/>\r", PRIORITY_HEARTBEAT)
+            # Query group status: <G1,Q/>
+            self._data_send_persistent(f"<G{group_id},Q/>\r", PRIORITY_HEARTBEAT)
+            # Query group line inputs
+            for line_id in range(1, self._source_count + 1):
+                self._data_send_persistent(f"<G{group_id}.L{line_id},Q/>\r", PRIORITY_HEARTBEAT)
+
     def get_status_of_zone(self, zone_id: int) -> Optional[int]:
         return self._zone_to_source_map.get(zone_id, None)
 
@@ -452,6 +551,14 @@ class MixerProtocol(asyncio.Protocol):
             Dictionary mapping line input ID (1-8) to enabled status (True/False)
         """
         return self._zone_line_inputs_map.get(zone_id, {}).copy()
+
+    def get_enabled_group_line_inputs(self, group_id: int) -> dict[int, bool]:
+        """Get which line inputs are enabled for a group.
+        
+        Returns:
+            Dictionary mapping line input ID (1-8) to enabled status (True/False)
+        """
+        return self._group_line_inputs_map.get(group_id, {}).copy()
 
     def get_status_of_all_zones(self) -> list[tuple[int, Optional[int]]]:
         return_list: list[tuple[int, int | None]] = []

@@ -42,6 +42,24 @@ class SourceChangeListener(ABC):
         """Called when line input enabled status is received. Dict maps line_id to enabled status."""
         pass
 
+    def group_label_changed(self, group_id: int, label: str):
+        """Called when group label is received."""
+        pass
+
+    def group_status_changed(self, group_id: int, enabled: bool, zones: list[int]):
+        """Called when group status is received.
+        
+        Args:
+            group_id: Group ID (1-4)
+            enabled: Whether the group is enabled
+            zones: List of zone IDs assigned to this group
+        """
+        pass
+
+    def group_line_inputs_changed(self, group_id: int, enabled_inputs: dict[int, bool]):
+        """Called when group line input enabled status is received. Dict maps line_id to enabled status."""
+        pass
+
     def volume_level_changed(self, zone_id: int, level):
         pass
 
@@ -80,6 +98,18 @@ class MultiplexingListener(SourceChangeListener):
     def volume_level_changed(self, zone_id: int, level):
         for listener in self._listeners:
             listener.volume_level_changed(zone_id, level)
+
+    def group_label_changed(self, group_id: int, label: str):
+        for listener in self._listeners:
+            listener.group_label_changed(group_id, label)
+
+    def group_status_changed(self, group_id: int, enabled: bool, zones: list[int]):
+        for listener in self._listeners:
+            listener.group_status_changed(group_id, enabled, zones)
+
+    def group_line_inputs_changed(self, group_id: int, enabled_inputs: dict[int, bool]):
+        for listener in self._listeners:
+            listener.group_line_inputs_changed(group_id, enabled_inputs)
 
     def connected(self):
         for listener in self._listeners:
@@ -132,6 +162,13 @@ class LoggingListener(SourceChangeListener):
 
     def volume_level_changed(self, zone_id: int, level):
         self.logger.info(f"Zone {zone_id} volume: {level}")
+
+    def group_label_changed(self, group_id: int, label: str):
+        self.logger.info(f"Group {group_id} label: {label}")
+
+    def group_status_changed(self, group_id: int, enabled: bool, zones: list[int]):
+        status = "enabled" if enabled else "disabled"
+        self.logger.info(f"Group {group_id} is {status} with zones: {zones}")
 
 
 class PrintingListener(SourceChangeListener):

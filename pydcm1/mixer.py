@@ -53,6 +53,25 @@ class ZoneLabelListener(SourceChangeListener):
             source.name = label
             self._mixer.sources_by_name[label] = source
     
+    def group_label_changed(self, group_id: int, label: str):
+        """Update the group label when received from device."""
+        group = self._mixer.groups_by_id.get(group_id)
+        if group:
+            # Remove old name from groups_by_name
+            old_name = group.name
+            if old_name in self._mixer.groups_by_name:
+                del self._mixer.groups_by_name[old_name]
+            # Update group name
+            group.name = label
+            self._mixer.groups_by_name[label] = group
+    
+    def group_status_changed(self, group_id: int, enabled: bool, zones: list[int]):
+        """Update the group status when received from device."""
+        group = self._mixer.groups_by_id.get(group_id)
+        if group:
+            group.enabled = enabled
+            group.zones = zones
+    
     def volume_level_changed(self, zone_id: int, level):
         pass
 
@@ -62,6 +81,15 @@ class Source:
     def __init__(self, source_id: int, name: str):
         self.id = source_id
         self.name = name
+
+
+class Group:
+    """Represents a group in the DCM1 mixer."""
+    def __init__(self, group_id: int, name: str, enabled: bool = False, zones: list[int] = None):
+        self.id = group_id
+        self.name = name
+        self.enabled = enabled
+        self.zones = zones if zones else []
 
 
 class DCM1Mixer:
@@ -74,6 +102,8 @@ class DCM1Mixer:
         self.zones_by_name : dict[str, Zone] = {}
         self.sources_by_id : dict[int, Source] = {}
         self.sources_by_name : dict[str, Source] = {}
+        self.groups_by_id : dict[int, Group] = {}
+        self.groups_by_name : dict[str, Group] = {}
         self.mac : Optional[str] = None
         self.device_name : Optional[str] = None
         self.firmware_version : Optional[str] = None
@@ -91,7 +121,7 @@ class DCM1Mixer:
         return list(self.sources_by_name.keys())
 
     async def async_connect(self):
-        # DCM1 has 8 zones and 8 line sources (hardcoded for now)
+        # DCM1 has 8 zones, 8 line sources, and 4 groups (hardcoded for now)
         # TODO: In the future, query zone/source names from device
         # For now, create simple numbered zones and sources
         for i in range(1, 9):
@@ -102,6 +132,12 @@ class DCM1Mixer:
             source = Source(i, f"Source {i}")
             self.sources_by_id[i] = source
             self.sources_by_name[source.name] = source
+        
+        # Initialize 4 groups
+        for i in range(1, 5):
+            group = Group(i, f"Group {i}")
+            self.groups_by_id[i] = group
+            self.groups_by_name[group.name] = group
         
         await self.protocol.async_connect()
 
@@ -138,6 +174,10 @@ class DCM1Mixer:
         self.protocol.send_zone_label_query_messages()
         self.protocol.send_source_label_query_messages()
         self.protocol.send_volume_level_query_messages()
+
+    def query_all_groups(self):
+        """Query all group labels and statuses from the device."""
+        self.protocol.send_all_group_queries()
 
     def status_of_zone(self, zone_id: int) -> Optional[int]:
         return self.protocol.get_status_of_zone(zone_id)
