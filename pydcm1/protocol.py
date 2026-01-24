@@ -407,6 +407,13 @@ class MixerProtocol(asyncio.Protocol):
             if zone_id not in self._zone_line_inputs_map:
                 self._zone_line_inputs_map[zone_id] = {}
             self._zone_line_inputs_map[zone_id][line_id] = enabled
+            
+            # Check if we've received all 8 line inputs for this zone
+            if len(self._zone_line_inputs_map[zone_id]) == 8:
+                # Notify listener with complete set
+                self._source_change_callback.line_inputs_changed(
+                    zone_id, self._zone_line_inputs_map[zone_id].copy()
+                )
             return
 
         # System info response

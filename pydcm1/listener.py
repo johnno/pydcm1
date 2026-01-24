@@ -38,6 +38,10 @@ class SourceChangeListener(ABC):
         """Called when zone volume level changes. Level is int (0-61) or 'mute'."""
         pass
 
+    def line_inputs_changed(self, zone_id: int, enabled_inputs: dict[int, bool]):
+        """Called when line input enabled status is received. Dict maps line_id to enabled status."""
+        pass
+
     def volume_level_changed(self, zone_id: int, level):
         pass
 
