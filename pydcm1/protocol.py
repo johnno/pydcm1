@@ -719,14 +719,16 @@ class MixerProtocol(asyncio.Protocol):
             zone_id: Zone ID (1-8)
             expected_level: Expected volume level (0-62, where 62=mute)
         """
-        await asyncio.sleep(0.15)  # Wait for command to apply (>100ms delay)
+        # Wait for SET command to be sent and processed by DCM1
+        # Min delay between sends is 0.1s, plus DCM1 processing time
+        await asyncio.sleep(0.3)
         self._logger.debug(f"Confirming volume for zone {zone_id}, expected: {expected_level}")
         
         # Query the volume level - this will broadcast the response to all listeners
         self._data_send_persistent(f"<Z{zone_id}.MU,LQ/>\r")
         
-        # Wait a bit for response to come back and be processed
-        await asyncio.sleep(0.2)
+        # Wait for QUERY to be sent (0.1s min delay) + network + DCM1 response + processing
+        await asyncio.sleep(0.5)
         
         # Check if the volume matches expected
         actual_level = self.get_volume_level(zone_id)
@@ -748,14 +750,16 @@ class MixerProtocol(asyncio.Protocol):
             zone_id: Zone ID (1-8)
             expected_source: Expected source ID (1-8)
         """
-        await asyncio.sleep(0.15)  # Wait for command to apply (>100ms delay)
+        # Wait for SET command to be sent and processed by DCM1
+        # Min delay between sends is 0.1s, plus DCM1 processing time
+        await asyncio.sleep(0.3)
         self._logger.debug(f"Confirming source for zone {zone_id}, expected: {expected_source}")
         
         # Query the source - this will broadcast the response to all listeners
         self._data_send_persistent(f"<Z{zone_id}.MU,SQ/>\r")
         
-        # Wait a bit for response to come back and be processed
-        await asyncio.sleep(0.2)
+        # Wait for QUERY to be sent (0.1s min delay) + network + DCM1 response + processing
+        await asyncio.sleep(0.5)
         
         # Check if the source matches expected
         actual_source = self.get_status_of_zone(zone_id)
