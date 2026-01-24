@@ -151,31 +151,19 @@ class MixerProtocol(asyncio.Protocol):
                 break
 
     async def _heartbeat(self):
-        """Send keepalive only when connection has been silent to detect stalled connections."""
+        """Periodically query zone status (volume and source) to sync with physical panel changes."""
         while True:
             await asyncio.sleep(self._heartbeat_time)
             
-            # Only send heartbeat if we haven't heard from the switch recently
-            time_since_last_received = time.time() - self._last_received_time
-            if time_since_last_received >= self._heartbeat_time:
-                # Only send if queue is empty - other commands will keep switch awake
-                if self._command_queue.empty():
-                    self._logger.debug(
-                        f"heartbeat - connection silent for {time_since_last_received:.1f}s, "
-                        "sending system version query to check connection"
-                    )
-                    # Use system version query as keepalive
-                    self._data_send_persistent("<SY,VQ/>\r")
-                else:
-                    self._logger.debug(
-                        f"heartbeat - connection silent for {time_since_last_received:.1f}s "
-                        "but queue has pending commands, skipping"
-                    )
-            else:
-                self._logger.debug(
-                    f"heartbeat - received data {time_since_last_received:.1f}s ago, "
-                    "connection is alive, skipping"
-                )
+            self._logger.debug(f"heartbeat - polling zone status for all {self._zone_count} zones")
+            
+            # Query volume and source for all zones
+            # This keeps HA in sync when staff use physical volume knobs or buttons
+            for zone_id in range(1, self._zone_count + 1):
+                # Query volume level
+                await self._command_queue.put(f"<Z{zone_id}.MU,LQ/>\r")
+                # Query source
+                await self._command_queue.put(f"<Z{zone_id}.MU,SQ/>\r")
 
     async def _wait_to_reconnect(self):
         """Attempt to reconnect after connection loss."""
