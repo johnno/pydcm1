@@ -48,6 +48,7 @@ class MixerProtocol(asyncio.Protocol):
         reconnect_time=10,
         use_event_connection_for_commands=False,
         enable_heartbeat=True,
+        command_confirmation=True,
     ):
         self._logger = logging.getLogger(__name__)
         self._heartbeat_time = heartbeat_time
@@ -58,6 +59,7 @@ class MixerProtocol(asyncio.Protocol):
         self._loop = asyncio.get_event_loop()
         self._use_event_connection_for_commands = use_event_connection_for_commands
         self._enable_heartbeat = enable_heartbeat
+        self._command_confirmation = command_confirmation
 
         self._connected = False
         self._reconnect = True
@@ -444,6 +446,10 @@ class MixerProtocol(asyncio.Protocol):
         command = f"<Z{zone_id}.MU,S{source_id}/>\r"
         self._logger.info(f"Queueing command: {command.encode()}")
         self._data_send_persistent(command)
+        
+        # Auto-confirm if enabled
+        if self._command_confirmation:
+            self._loop.create_task(self._confirm_source(zone_id, source_id))
 
     def send_volume_level(self, zone_id: int, level):
         """Set volume level for a zone.
@@ -482,6 +488,11 @@ class MixerProtocol(asyncio.Protocol):
         command = f"<Z{zone_id}.MU,L{level_str}/>\r"
         self._logger.info(f"Queueing command: {command.encode()}")
         self._data_send_persistent(command)
+        
+        # Auto-confirm if enabled
+        if self._command_confirmation:
+            expected_level = 62 if level_str == "62" else int(level_str)
+            self._loop.create_task(self._confirm_volume(zone_id, expected_level))
 
     def send_zone_source_query_messages(self):
         self._logger.info(f"Sending status query messages for all zones")
@@ -566,3 +577,57 @@ class MixerProtocol(asyncio.Protocol):
         # Based on log: <Z1.MU,MQ/> queries mute status
         # Might be <Z1.MU,M/> to mute?
         self._logger.warning("Mute control not yet implemented for DCM1")
+
+    async def _confirm_volume(self, zone_id: int, expected_level: int):
+        """Query volume after setting to confirm and broadcast to all listeners.
+        
+        Args:
+            zone_id: Zone ID (1-8)
+            expected_level: Expected volume level (0-62, where 62=mute)
+        """
+        await asyncio.sleep(0.15)  # Wait for command to apply (>100ms delay)
+        self._logger.debug(f"Confirming volume for zone {zone_id}, expected: {expected_level}")
+        
+        # Query the volume level - this will broadcast the response to all listeners
+        self._data_send_persistent(f"<Z{zone_id}.MU,LQ/>\r")
+        
+        # Wait a bit for response to come back and be processed
+        await asyncio.sleep(0.2)
+        
+        # Check if the volume matches expected
+        actual_level = self.get_volume_level(zone_id)
+        if actual_level is None:
+            self._logger.warning(f"Volume confirmation: no response received for zone {zone_id}")
+        elif actual_level == "mute" and expected_level == 62:
+            self._logger.info(f"Volume confirmation: zone {zone_id} muted successfully")
+        elif actual_level == "mute" and expected_level != 62:
+            self._logger.warning(f"Volume mismatch: zone {zone_id} set to {expected_level}, got mute")
+        elif isinstance(actual_level, int) and actual_level != expected_level:
+            self._logger.warning(f"Volume mismatch: zone {zone_id} set to {expected_level}, got {actual_level}")
+        else:
+            self._logger.info(f"Volume confirmation: zone {zone_id} set to {actual_level} successfully")
+
+    async def _confirm_source(self, zone_id: int, expected_source: int):
+        """Query source after setting to confirm and broadcast to all listeners.
+        
+        Args:
+            zone_id: Zone ID (1-8)
+            expected_source: Expected source ID (1-8)
+        """
+        await asyncio.sleep(0.15)  # Wait for command to apply (>100ms delay)
+        self._logger.debug(f"Confirming source for zone {zone_id}, expected: {expected_source}")
+        
+        # Query the source - this will broadcast the response to all listeners
+        self._data_send_persistent(f"<Z{zone_id}.MU,SQ/>\r")
+        
+        # Wait a bit for response to come back and be processed
+        await asyncio.sleep(0.2)
+        
+        # Check if the source matches expected
+        actual_source = self.get_status_of_zone(zone_id)
+        if actual_source is None:
+            self._logger.warning(f"Source confirmation: no response received for zone {zone_id}")
+        elif actual_source != expected_source:
+            self._logger.warning(f"Source mismatch: zone {zone_id} set to {expected_source}, got {actual_source}")
+        else:
+            self._logger.info(f"Source confirmation: zone {zone_id} set to source {actual_source} successfully")
