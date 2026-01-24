@@ -173,11 +173,11 @@ class MixerProtocol(asyncio.Protocol):
                 break
 
     async def _heartbeat(self):
-        """Periodically query zone status (volume and source) to sync with physical panel changes."""
+        """Periodically query zone and group status (volume and source) to sync with physical panel changes."""
         while True:
             await asyncio.sleep(self._heartbeat_time)
             
-            self._logger.debug(f"heartbeat - polling zone status for all {self._zone_count} zones")
+            self._logger.debug(f"heartbeat - polling status for {self._zone_count} zones and 4 groups")
             
             # Query volume and source for all zones
             # This keeps HA in sync when staff use physical volume knobs or buttons
@@ -189,6 +189,16 @@ class MixerProtocol(asyncio.Protocol):
                 # Query source with low priority
                 self._command_counter += 1
                 await self._command_queue.put((PRIORITY_HEARTBEAT, self._command_counter, (f"<Z{zone_id}.MU,SQ/>\r", None)))
+            
+            # Query volume and source for all groups (4 groups on DCM1)
+            # This keeps groups in sync with physical panel changes
+            for group_id in range(1, 5):
+                # Query group volume level with low priority
+                self._command_counter += 1
+                await self._command_queue.put((PRIORITY_HEARTBEAT, self._command_counter, (f"<G{group_id}.MU,LQ/>\r", None)))
+                # Query group source with low priority
+                self._command_counter += 1
+                await self._command_queue.put((PRIORITY_HEARTBEAT, self._command_counter, (f"<G{group_id}.MU,SQ/>\r", None)))
 
     async def _wait_to_reconnect(self):
         """Attempt to reconnect after connection loss."""
