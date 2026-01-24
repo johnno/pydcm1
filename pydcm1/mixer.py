@@ -80,6 +80,11 @@ class ZoneLabelListener(SourceChangeListener):
             # Track that we received this group's status
             self._mixer._groups_status_received.add(group_id)
     
+    def group_volume_changed(self, group_id: int, level):
+        """Track when a group's volume is received."""
+        # Track that we received this group's volume
+        self._mixer._groups_volume_received.add(group_id)
+    
     def volume_level_changed(self, zone_id: int, level):
         pass
     
@@ -124,6 +129,7 @@ class DCM1Mixer:
         # Track which group IDs have received their status responses
         self._groups_status_received : set[int] = set()
         self._groups_labels_received : set[int] = set()
+        self._groups_volume_received : set[int] = set()
         
         # Track which zone and source IDs have received their labels
         self._zones_labels_received : set[int] = set()
@@ -265,19 +271,23 @@ class DCM1Mixer:
         expected_group_ids = set(self.groups_by_id.keys())
         
         while asyncio.get_event_loop().time() - start_time < timeout:
-            # Check if we've received labels and status for all groups
+            # Check if we've received labels, status, and volume for all groups
             if (self._groups_labels_received >= expected_group_ids and 
-                self._groups_status_received >= expected_group_ids):
+                self._groups_status_received >= expected_group_ids and
+                self._groups_volume_received >= expected_group_ids):
                 return True
             await asyncio.sleep(0.1)
         
         # Timeout - log what we're missing
         missing_labels = expected_group_ids - self._groups_labels_received
         missing_status = expected_group_ids - self._groups_status_received
+        missing_volume = expected_group_ids - self._groups_volume_received
         if missing_labels:
             print(f"Warning: Timeout waiting for group labels: {missing_labels}")
         if missing_status:
             print(f"Warning: Timeout waiting for group status: {missing_status}")
+        if missing_volume:
+            print(f"Warning: Timeout waiting for group volume: {missing_volume}")
         return False
 
     def status_of_zone(self, zone_id: int) -> Optional[int]:
