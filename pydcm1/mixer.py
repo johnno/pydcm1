@@ -157,6 +157,24 @@ class DCM1Mixer:
         """
         self.protocol.send_volume_level(zone_id, level)
 
+    def set_group_source(self, group_id: int, source_id: int):
+        """Set a group to use a specific source.
+        
+        Args:
+            group_id: Group ID (1-4)
+            source_id: Source ID (1-8)
+        """
+        self.protocol.send_group_source(source_id, group_id)
+
+    def set_group_volume(self, group_id: int, level):
+        """Set volume level for a group.
+        
+        Args:
+            group_id: Group ID (1-4)
+            level: Volume level - int (0-61 where 20 = -20dB, 62 for mute) or "mute"
+        """
+        self.protocol.send_group_volume_level(group_id, level)
+
     def change_source(self, source_id: int, zone_id: int):
         self.protocol.send_change_source(source_id, zone_id)
 

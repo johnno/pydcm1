@@ -492,6 +492,67 @@ class MixerProtocol(asyncio.Protocol):
             expected_level = 62 if level_str == "62" else int(level_str)
             self._loop.create_task(self._confirm_volume(zone_id, expected_level))
 
+    def send_group_source(self, source_id: int, group_id: int):
+        """Set a group to use a specific source.
+        
+        Args:
+            source_id: Source ID (1-8)
+            group_id: Group ID (1-4)
+        """
+        self._logger.info(
+            f"Sending Group source change message - Group: {group_id} changed to source: {source_id}"
+        )
+        # DCM1 uses <GX.MU,SN/> to set group X to source N
+        # Example: <G1.MU,S7/> sets group 1 to source 7
+        # Response: <g1.mu,s=7/>
+        if not (1 <= source_id <= self._source_count):
+            self._logger.error(f"Invalid source_id {source_id}, must be 1-{self._source_count}")
+            return
+        if not (1 <= group_id <= 4):  # DCM1 has 4 groups
+            self._logger.error(f"Invalid group_id {group_id}, must be 1-4")
+            return
+        
+        command = f"<G{group_id}.MU,S{source_id}/>\r"
+        self._logger.info(f"Queueing command: {command.encode()}")
+        self._data_send_persistent(command)
+
+    def send_group_volume_level(self, group_id: int, level):
+        """Set volume level for a group.
+        
+        Args:
+            group_id: Group ID (1-4)
+            level: Volume level - int (0-61 where 20 = -20dB, 62 for mute) or "mute"
+        """
+        self._logger.info(
+            f"Setting group volume level - Group: {group_id} to level: {level}"
+        )
+        # DCM1 uses <GX.MU,LN/> to set group X to level N
+        # Example: <G1.MU,L21/> sets group 1 to -21dB
+        # Level 62 is mute: <G1.MU,L62/> mutes group 1
+        # Response: <g1.mu,l=21/> or <g1.mu,l=mute/>
+        if not (1 <= group_id <= 4):  # DCM1 has 4 groups
+            self._logger.error(f"Invalid group_id {group_id}, must be 1-4")
+            return
+        
+        # Validate level
+        if isinstance(level, str):
+            if level.lower() != "mute":
+                self._logger.error(f"Invalid level string '{level}', must be 'mute' or integer 0-62")
+                return
+            level_str = "62"  # Mute is level 62
+        elif isinstance(level, int):
+            if not (0 <= level <= 62):
+                self._logger.error(f"Invalid level {level}, must be 0-62 (62=mute)")
+                return
+            level_str = str(level)
+        else:
+            self._logger.error(f"Invalid level type {type(level)}, must be int or 'mute'")
+            return
+        
+        command = f"<G{group_id}.MU,L{level_str}/>\r"
+        self._logger.info(f"Queueing command: {command.encode()}")
+        self._data_send_persistent(command)
+
     def send_zone_source_query_messages(self):
         self._logger.info(f"Sending status query messages for all zones")
         # DCM1 uses <ZX.MU,SQ/> to query which source is active on zone X
