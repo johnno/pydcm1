@@ -40,6 +40,8 @@ class ZoneLabelListener(SourceChangeListener):
             # Update zone name
             zone.name = label
             self._mixer.zones_by_name[label] = zone
+            # Track that we received this zone's label
+            self._mixer._zones_labels_received.add(zone_id)
     
     def source_label_changed(self, source_id: int, label: str):
         """Update the source label when received from device."""
@@ -52,6 +54,8 @@ class ZoneLabelListener(SourceChangeListener):
             # Update source name
             source.name = label
             self._mixer.sources_by_name[label] = source
+            # Track that we received this source's label
+            self._mixer._sources_labels_received.add(source_id)
     
     def group_label_changed(self, group_id: int, label: str):
         """Update the group label when received from device."""
@@ -64,6 +68,8 @@ class ZoneLabelListener(SourceChangeListener):
             # Update group name
             group.name = label
             self._mixer.groups_by_name[label] = group
+            # Track that we received this group's label
+            self._mixer._groups_labels_received.add(group_id)
     
     def group_status_changed(self, group_id: int, enabled: bool, zones: list[int]):
         """Update the group status when received from device."""
@@ -71,9 +77,16 @@ class ZoneLabelListener(SourceChangeListener):
         if group:
             group.enabled = enabled
             group.zones = zones
+            # Track that we received this group's status
+            self._mixer._groups_status_received.add(group_id)
     
     def volume_level_changed(self, zone_id: int, level):
         pass
+    
+    def line_inputs_changed(self, zone_id: int, line_inputs: dict[int, bool]):
+        """Track when a zone's line input data is received."""
+        # Protocol only calls this when all 8 line inputs are received
+        self._mixer._zones_line_inputs_received.add(zone_id)
 
 
 class Source:
@@ -107,6 +120,17 @@ class DCM1Mixer:
         self.mac : Optional[str] = None
         self.device_name : Optional[str] = None
         self.firmware_version : Optional[str] = None
+        
+        # Track which group IDs have received their status responses
+        self._groups_status_received : set[int] = set()
+        self._groups_labels_received : set[int] = set()
+        
+        # Track which zone and source IDs have received their labels
+        self._zones_labels_received : set[int] = set()
+        self._sources_labels_received : set[int] = set()
+        
+        # Track which zone IDs have received complete line input data (all 8 inputs)
+        self._zones_line_inputs_received : set[int] = set()
         
         # Register listener to update zone labels
         self._zone_label_listener = ZoneLabelListener(self)
@@ -193,9 +217,68 @@ class DCM1Mixer:
         self.protocol.send_source_label_query_messages()
         self.protocol.send_volume_level_query_messages()
 
+    async def wait_for_zone_source_labels(self, timeout: float = 10.0):
+        """Wait for all zone and source labels to be received from the device.
+        
+        Args:
+            timeout: Maximum time to wait in seconds
+            
+        Returns:
+            True if all data received, False if timeout
+        """
+        import asyncio
+        start_time = asyncio.get_event_loop().time()
+        expected_zone_ids = set(self.zones_by_id.keys())
+        expected_source_ids = set(self.sources_by_id.keys())
+        
+        while asyncio.get_event_loop().time() - start_time < timeout:
+            # Check if we've received labels for all zones and sources
+            if (self._zones_labels_received >= expected_zone_ids and 
+                self._sources_labels_received >= expected_source_ids):
+                return True
+            await asyncio.sleep(0.1)
+        
+        # Timeout - log what we're missing
+        missing_zones = expected_zone_ids - self._zones_labels_received
+        missing_sources = expected_source_ids - self._sources_labels_received
+        if missing_zones:
+            print(f"Warning: Timeout waiting for zone labels: {missing_zones}")
+        if missing_sources:
+            print(f"Warning: Timeout waiting for source labels: {missing_sources}")
+        return False
+
     def query_all_groups(self):
         """Query all group labels and statuses from the device."""
         self.protocol.send_all_group_queries()
+
+    async def wait_for_group_data(self, timeout: float = 10.0):
+        """Wait for all group data to be received from the device.
+        
+        Args:
+            timeout: Maximum time to wait in seconds
+            
+        Returns:
+            True if all data received, False if timeout
+        """
+        import asyncio
+        start_time = asyncio.get_event_loop().time()
+        expected_group_ids = set(self.groups_by_id.keys())
+        
+        while asyncio.get_event_loop().time() - start_time < timeout:
+            # Check if we've received labels and status for all groups
+            if (self._groups_labels_received >= expected_group_ids and 
+                self._groups_status_received >= expected_group_ids):
+                return True
+            await asyncio.sleep(0.1)
+        
+        # Timeout - log what we're missing
+        missing_labels = expected_group_ids - self._groups_labels_received
+        missing_status = expected_group_ids - self._groups_status_received
+        if missing_labels:
+            print(f"Warning: Timeout waiting for group labels: {missing_labels}")
+        if missing_status:
+            print(f"Warning: Timeout waiting for group status: {missing_status}")
+        return False
 
     def status_of_zone(self, zone_id: int) -> Optional[int]:
         return self.protocol.get_status_of_zone(zone_id)
@@ -221,6 +304,31 @@ class DCM1Mixer:
             zone_id: Zone ID (1-8)
         """
         self.protocol.send_line_input_enable_query_messages(zone_id)
+
+    async def wait_for_zone_line_inputs(self, timeout: float = 10.0):
+        """Wait for all zone line input data to be received from the device.
+        
+        Args:
+            timeout: Maximum time to wait in seconds
+            
+        Returns:
+            True if all data received, False if timeout
+        """
+        import asyncio
+        start_time = asyncio.get_event_loop().time()
+        expected_zone_ids = set(self.zones_by_id.keys())
+        
+        while asyncio.get_event_loop().time() - start_time < timeout:
+            # Check if we've received line inputs for all zones
+            if self._zones_line_inputs_received >= expected_zone_ids:
+                return True
+            await asyncio.sleep(0.1)
+        
+        # Timeout - log what we're missing
+        missing = expected_zone_ids - self._zones_line_inputs_received
+        if missing:
+            print(f"Warning: Timeout waiting for zone line inputs: {missing}")
+        return False
 
     def send_volume_up(self, zone_id: int):
         """Send volume up command to a zone."""
