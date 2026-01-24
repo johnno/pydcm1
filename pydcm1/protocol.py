@@ -2,10 +2,14 @@ import asyncio
 import logging
 import re
 import time
-from asyncio import Task
+from asyncio import PriorityQueue, Task
 from typing import Any, Callable, Optional
 
 from pydcm1.listener import SourceChangeListener
+
+# Command priority levels (lower number = higher priority)
+PRIORITY_USER_COMMAND = 10  # User-initiated commands (volume, source changes)
+PRIORITY_HEARTBEAT = 20     # Background polling/heartbeat queries
 
 # DCM1 uses XML-style commands and responses
 # Response when a zone's source is queried with <Z1.MU,SQ/>:
@@ -73,8 +77,9 @@ class MixerProtocol(asyncio.Protocol):
         self._zone_count: int = 8
         self._source_count: int = 8
         self._heartbeat_task = None
-        # Command queue to serialize all outgoing commands
-        self._command_queue: asyncio.Queue = asyncio.Queue()
+        # Priority queue to serialize commands (user commands jump ahead of heartbeat)
+        self._command_queue: PriorityQueue = PriorityQueue()
+        self._command_counter: int = 0  # Counter for FIFO order within same priority
         self._command_worker_task: Optional[Task[Any]] = None
         # Track last send time to avoid clashes between commands
         self._last_send_time: float = 0.0
@@ -120,10 +125,11 @@ class MixerProtocol(asyncio.Protocol):
         self.send_zone_source_query_messages()
 
     async def _command_worker(self):
-        """Worker task that processes all outgoing commands from the queue."""
+        """Worker task that processes all outgoing commands from the priority queue."""
         while True:
             try:
-                message, use_persistent, response_validator = await self._command_queue.get()
+                # Priority queue returns (priority, counter, (message, use_persistent, response_validator))
+                priority, counter, (message, use_persistent, response_validator) = await self._command_queue.get()
                 try:
                     # Enforce minimum delay between commands to avoid MCU serial port clashes
                     time_since_last_send = time.time() - self._last_send_time
@@ -159,11 +165,14 @@ class MixerProtocol(asyncio.Protocol):
             
             # Query volume and source for all zones
             # This keeps HA in sync when staff use physical volume knobs or buttons
+            # Use low priority so user commands can jump ahead
             for zone_id in range(1, self._zone_count + 1):
-                # Query volume level
-                await self._command_queue.put(f"<Z{zone_id}.MU,LQ/>\r")
-                # Query source
-                await self._command_queue.put(f"<Z{zone_id}.MU,SQ/>\r")
+                # Query volume level with low priority
+                self._command_counter += 1
+                await self._command_queue.put((PRIORITY_HEARTBEAT, self._command_counter, (f"<Z{zone_id}.MU,LQ/>\r", True, None)))
+                # Query source with low priority
+                self._command_counter += 1
+                await self._command_queue.put((PRIORITY_HEARTBEAT, self._command_counter, (f"<Z{zone_id}.MU,SQ/>\r", True, None)))
 
     async def _wait_to_reconnect(self):
         """Attempt to reconnect after connection loss."""
@@ -225,16 +234,18 @@ class MixerProtocol(asyncio.Protocol):
                 self._logger.debug(f"Whole message: {message}")
                 self._process_received_packet(message)
 
-    def _data_send(self, message: str, response_validator: Optional[Callable[[str], bool]] = None):
+    def _data_send(self, message: str, response_validator: Optional[Callable[[str], bool]] = None, priority: int = PRIORITY_USER_COMMAND):
         """Queue a command to be sent (either persistent or ephemeral based on config).
         
         Args:
             message: The message to send
             response_validator: Optional function that returns True if response is valid
+            priority: Command priority (lower = higher priority, default=user commands)
         """
         use_persistent = self._use_event_connection_for_commands
         try:
-            self._command_queue.put_nowait((message, use_persistent, response_validator))
+            self._command_counter += 1
+            self._command_queue.put_nowait((priority, self._command_counter, (message, use_persistent, response_validator)))
         except asyncio.QueueFull:
             self._logger.error("Command queue is full, dropping command")
 
@@ -320,10 +331,16 @@ class MixerProtocol(asyncio.Protocol):
         except Exception as e:
             self._logger.error(f"Ephemeral: Error in ephemeral connection: {e}")
 
-    def _data_send_persistent(self, message):
-        """Queue a command to be sent via the persistent connection."""
+    def _data_send_persistent(self, message, priority: int = PRIORITY_USER_COMMAND):
+        """Queue a command to be sent via the persistent connection.
+        
+        Args:
+            message: The message to send
+            priority: Command priority (lower = higher priority, default=user commands)
+        """
         try:
-            self._command_queue.put_nowait((message, True, None))
+            self._command_counter += 1
+            self._command_queue.put_nowait((priority, self._command_counter, (message, True, None)))
         except asyncio.QueueFull:
             self._logger.error("Command queue is full, dropping command")
 
