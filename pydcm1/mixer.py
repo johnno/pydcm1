@@ -85,6 +85,11 @@ class ZoneLabelListener(SourceChangeListener):
         # Track that we received this group's volume
         self._mixer._groups_volume_received.add(group_id)
     
+    def group_line_inputs_changed(self, group_id: int, line_inputs: dict[int, bool]):
+        """Track when a group's line input data is received."""
+        # Protocol only calls this when all 8 line inputs are received
+        self._mixer._groups_line_inputs_received.add(group_id)
+    
     def volume_level_changed(self, zone_id: int, level):
         pass
     
@@ -130,6 +135,7 @@ class DCM1Mixer:
         self._groups_status_received : set[int] = set()
         self._groups_labels_received : set[int] = set()
         self._groups_volume_received : set[int] = set()
+        self._groups_line_inputs_received : set[int] = set()
         
         # Track which zone and source IDs have received their labels
         self._zones_labels_received : set[int] = set()
@@ -271,10 +277,11 @@ class DCM1Mixer:
         expected_group_ids = set(self.groups_by_id.keys())
         
         while asyncio.get_event_loop().time() - start_time < timeout:
-            # Check if we've received labels, status, and volume for all groups
+            # Check if we've received labels, status, volume, and line inputs for all groups
             if (self._groups_labels_received >= expected_group_ids and 
                 self._groups_status_received >= expected_group_ids and
-                self._groups_volume_received >= expected_group_ids):
+                self._groups_volume_received >= expected_group_ids and
+                self._groups_line_inputs_received >= expected_group_ids):
                 return True
             await asyncio.sleep(0.1)
         
@@ -282,12 +289,15 @@ class DCM1Mixer:
         missing_labels = expected_group_ids - self._groups_labels_received
         missing_status = expected_group_ids - self._groups_status_received
         missing_volume = expected_group_ids - self._groups_volume_received
+        missing_line_inputs = expected_group_ids - self._groups_line_inputs_received
         if missing_labels:
             print(f"Warning: Timeout waiting for group labels: {missing_labels}")
         if missing_status:
             print(f"Warning: Timeout waiting for group status: {missing_status}")
         if missing_volume:
             print(f"Warning: Timeout waiting for group volume: {missing_volume}")
+        if missing_line_inputs:
+            print(f"Warning: Timeout waiting for group line inputs: {missing_line_inputs}")
         return False
 
     def status_of_zone(self, zone_id: int) -> Optional[int]:
