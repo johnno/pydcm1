@@ -157,10 +157,11 @@ class MixerProtocol(asyncio.Protocol):
                         await asyncio.sleep(wait_time)
                     
                     if self._transport and self._connected:
-                        self._logger.debug(f"data_send persistent: {message.encode()}")
+                        self._logger.info(f"SEND: Command #{counter} (priority={priority}): {message.encode()}")
                         self._transport.write(message.encode())
+                        self._logger.info(f"SEND: Command #{counter} written to transport successfully")
                     else:
-                        self._logger.warning("Cannot send on persistent connection: not connected")
+                        self._logger.error(f"SEND FAILED: Command #{counter} - not connected (transport={self._transport is not None}, connected={self._connected})")
                     
                     self._last_send_time = time.time()
                 except Exception as e:
@@ -258,7 +259,9 @@ class MixerProtocol(asyncio.Protocol):
         """
         try:
             self._command_counter += 1
+            self._logger.info(f"QUEUE: Adding command #{self._command_counter} (priority={priority}): {message.strip()}")
             self._command_queue.put_nowait((priority, self._command_counter, (message, None)))
+            self._logger.info(f"QUEUE: Command #{self._command_counter} queued successfully, queue size ~= {self._command_queue.qsize()}")
         except asyncio.QueueFull:
             self._logger.error("Command queue is full, dropping command")
 
@@ -268,7 +271,7 @@ class MixerProtocol(asyncio.Protocol):
         # Zone source response: <z1.mu,s=7/> means zone 1 is using source 7 (0 = no source)
         zone_source_match = ZONE_SOURCE_RESPONSE.match(message)
         if zone_source_match:
-            self._logger.debug(f"Zone source response received: {message}")
+            self._logger.info(f"RECV: Zone source response: {message}")
             zone_id = int(zone_source_match.group(1))
             source_id = int(zone_source_match.group(2))
             # Source ID 0 means no source is active, don't process it
@@ -299,7 +302,7 @@ class MixerProtocol(asyncio.Protocol):
         # Zone volume level response: <z1.mu,l=20/> or <z1.mu,l=mute/>
         volume_level_match = ZONE_VOLUME_LEVEL_RESPONSE.match(message)
         if volume_level_match:
-            self._logger.debug(f"Volume level response received: {message}")
+            self._logger.info(f"RECV: Volume level response: {message}")
             zone_id = int(volume_level_match.group(1))
             level_str = volume_level_match.group(2)
             # Parse level - can be numeric or "mute"
