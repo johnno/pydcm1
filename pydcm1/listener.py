@@ -182,6 +182,20 @@ class LoggingListener(SourceChangeListener):
         status = "enabled" if enabled else "disabled"
         self.logger.info(f"Group {group_id} is {status} with zones: {zones}")
 
+    def group_volume_changed(self, group_id: int, level):
+        self.logger.info(f"Group {group_id} volume: {level}")
+
+    def group_line_inputs_changed(self, group_id: int, line_inputs: dict[int, bool]):
+        enabled = [line_id for line_id, enabled in line_inputs.items() if enabled]
+        self.logger.info(f"Group {group_id} enabled line inputs: {enabled}")
+
+    def line_inputs_changed(self, zone_id: int, line_inputs: dict[int, bool]):
+        enabled = [line_id for line_id, enabled in line_inputs.items() if enabled]
+        self.logger.info(f"Zone {zone_id} enabled line inputs: {enabled}")
+
+    def group_source_changed(self, group_id: int, source_id: int):
+        self.logger.info(f"Group {group_id} changed to source: {source_id}")
+
 
 class PrintingListener(SourceChangeListener):
 
@@ -205,6 +219,27 @@ class PrintingListener(SourceChangeListener):
 
     def volume_level_changed(self, zone_id: int, level):
         print(f"Zone {zone_id} volume changed to: {level}")
+
+    def group_label_changed(self, group_id: int, label: str):
+        print(f"Group {group_id} label changed to: {label}")
+
+    def group_status_changed(self, group_id: int, enabled: bool, zones: list[int]):
+        status = "enabled" if enabled else "disabled"
+        print(f"Group {group_id} is {status} with zones: {zones}")
+
+    def group_volume_changed(self, group_id: int, level):
+        print(f"Group {group_id} volume changed to: {level}")
+
+    def group_line_inputs_changed(self, group_id: int, line_inputs: dict[int, bool]):
+        enabled = [line_id for line_id, enabled in line_inputs.items() if enabled]
+        print(f"Group {group_id} enabled line inputs: {enabled}")
+
+    def line_inputs_changed(self, zone_id: int, line_inputs: dict[int, bool]):
+        enabled = [line_id for line_id, enabled in line_inputs.items() if enabled]
+        print(f"Zone {zone_id} enabled line inputs: {enabled}")
+
+    def group_source_changed(self, group_id: int, source_id: int):
+        print(f"Group {group_id} changed to source: {source_id}")
 
 
 class TurningOnListener(SourceChangeListener):
@@ -244,6 +279,30 @@ class TurningOnListener(SourceChangeListener):
             self.last_requested_source_id = None
 
     def zone_label_changed(self, zone_id: int, label: str):
+        pass
+
+    def source_label_changed(self, source_id: int, label: str):
+        pass
+
+    def volume_level_changed(self, zone_id: int, level):
+        pass
+
+    def line_inputs_changed(self, zone_id: int, line_inputs: dict[int, bool]):
+        pass
+
+    def group_label_changed(self, group_id: int, label: str):
+        pass
+
+    def group_status_changed(self, group_id: int, enabled: bool, zones: list[int]):
+        pass
+
+    def group_volume_changed(self, group_id: int, level):
+        pass
+
+    def group_line_inputs_changed(self, group_id: int, line_inputs: dict[int, bool]):
+        pass
+
+    def group_source_changed(self, group_id: int, source_id: int):
         pass
 
     def error(self, error_message: str):
