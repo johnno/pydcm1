@@ -23,10 +23,10 @@ async def show_status(hostname: str, port: int):
     print("Querying zone labels, source labels, volume levels, and status...")
     await asyncio.sleep(5)
     
-    # Query group information (labels, status, and line inputs)
+    # Query group information (labels, status, volume, and line inputs)
     print("Querying group information...")
     mixer.query_all_groups()
-    await asyncio.sleep(5)  # Wait for 40 group commands (4 groups × 10)
+    await asyncio.sleep(5)  # Wait for 44 group commands (4 groups × 11)
     
     # Query line input enables for all zones
     for zone_id in range(1, 9):
@@ -84,6 +84,16 @@ async def show_status(hostname: str, port: int):
         status = "ENABLED " if group.enabled else "DISABLED"
         zones_str = ",".join(str(z) for z in group.zones) if group.zones else "none"
         
+        # Get volume for the group
+        volume = mixer.protocol.get_group_volume_level(group_id)
+        if volume == "mute":
+            volume_str = "MUTE"
+        elif volume is not None:
+            db_value = -volume
+            volume_str = f"{db_value}dB"
+        else:
+            volume_str = "unknown"
+        
         # Get line inputs for the group
         enabled_inputs = mixer.protocol.get_enabled_group_line_inputs(group_id)
         if enabled_inputs:
@@ -93,7 +103,7 @@ async def show_status(hostname: str, port: int):
             inputs_str = "querying..."
         
         group_label = f"Group {group_id} ({group.name}):"
-        print(f"{group_label:30s} [{status:8s}] | Zones: {zones_str:10s} | Inputs: {inputs_str}")
+        print(f"{group_label:30s} [{status:8s}] | Vol: {volume_str:10s} | Zones: {zones_str:10s} | Inputs: {inputs_str}")
     
     print("-" * 100)
     

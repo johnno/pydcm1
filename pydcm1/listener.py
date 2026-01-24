@@ -60,6 +60,10 @@ class SourceChangeListener(ABC):
         """Called when group line input enabled status is received. Dict maps line_id to enabled status."""
         pass
 
+    def group_volume_changed(self, group_id: int, level):
+        """Called when a group's volume level changes."""
+        pass
+
     def volume_level_changed(self, zone_id: int, level):
         pass
 
@@ -110,6 +114,10 @@ class MultiplexingListener(SourceChangeListener):
     def group_line_inputs_changed(self, group_id: int, enabled_inputs: dict[int, bool]):
         for listener in self._listeners:
             listener.group_line_inputs_changed(group_id, enabled_inputs)
+
+    def group_volume_changed(self, group_id: int, level):
+        for listener in self._listeners:
+            listener.group_volume_changed(group_id, level)
 
     def connected(self):
         for listener in self._listeners:

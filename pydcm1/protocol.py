@@ -48,6 +48,9 @@ GROUP_ENABLE_RESPONSE = re.compile(r"<g(\d+),q=([^/]+)/>", re.IGNORECASE)
 # Group line input enable response: <g1.l1,q=e, pri = off/> where q=e is enabled, q=d is disabled
 GROUP_LINE_INPUT_ENABLE_RESPONSE = re.compile(r"<g(\d+)\.l(\d+),q=([ed]),", re.IGNORECASE)
 
+# Group volume level response: <g1.mu,l=20/> or <g1.mu,l=mute/>
+GROUP_VOLUME_LEVEL_RESPONSE = re.compile(r"<g(\d+)\.mu,l=([^/]+)/>", re.IGNORECASE)
+
 
 class MixerProtocol(asyncio.Protocol):
     _received_message: str
@@ -85,6 +88,7 @@ class MixerProtocol(asyncio.Protocol):
         self._zone_to_volume_map = {}  # Maps zone_id to volume level (int or "mute")
         self._zone_line_inputs_map = {}  # Maps zone_id to dict of line_id: enabled_bool
         self._group_line_inputs_map = {}  # Maps group_id to dict of line_id: enabled_bool
+        self._group_volume_map = {}  # Maps group_id to volume level (int or "mute")
         # DCM1 has 8 zones and 8 line sources (hardcoded)
         self._zone_count: int = 8
         self._source_count: int = 8
@@ -397,6 +401,22 @@ class MixerProtocol(asyncio.Protocol):
                 )
             return
 
+        # Group volume level response
+        match = GROUP_VOLUME_LEVEL_RESPONSE.match(message)
+        if match:
+            group_id = int(match.group(1))
+            level_str = match.group(2)
+            
+            if level_str.lower() == "mute":
+                level = "mute"
+            else:
+                level = int(level_str)
+            
+            self._group_volume_map[group_id] = level
+            self._logger.info(f"Group {group_id} volume: {level}")
+            self._source_change_callback.group_volume_changed(group_id, level)
+            return
+
         self._logger.debug(f"Unhandled message received: {message}")
 
     def _process_source_changed(self, source_id, zone_id):
@@ -524,15 +544,23 @@ class MixerProtocol(asyncio.Protocol):
         # Response: <gX.lY,q=e, pri = off/> where q=e means enabled, q=d means disabled
         for line_id in range(1, self._source_count + 1):
             self._data_send_persistent(f"<G{group_id}.L{line_id},Q/>\r", PRIORITY_HEARTBEAT)
-
+    def send_group_volume_query_messages(self, group_id: int):
+        """Send queries for a group's volume level."""
+        self._logger.info(f"Querying volume level for group {group_id}")
+        self._data_send_persistent(f"<G{group_id}.MU,LQ/>\r")
     def send_all_group_queries(self):
-        """Query labels, status, and line inputs for all 4 groups."""
-        self._logger.info("Querying all group labels, statuses, and line inputs")
+        """Query labels, status, volume, and line inputs for all 4 groups.
+        
+        Sends 11 commands per group (label + status + volume + 8 line inputs) = 44 total commands.
+        """
+        self._logger.info("Querying all group labels, statuses, volumes, and line inputs")
         for group_id in range(1, 5):  # DCM1 has 4 groups (G1-G4)
             # Query group label: <G1,LQ/>
             self._data_send_persistent(f"<G{group_id},LQ/>\r", PRIORITY_HEARTBEAT)
             # Query group status: <G1,Q/>
             self._data_send_persistent(f"<G{group_id},Q/>\r", PRIORITY_HEARTBEAT)
+            # Query group volume: <G1.MU,LQ/>
+            self._data_send_persistent(f"<G{group_id}.MU,LQ/>\r", PRIORITY_HEARTBEAT)
             # Query group line inputs
             for line_id in range(1, self._source_count + 1):
                 self._data_send_persistent(f"<G{group_id}.L{line_id},Q/>\r", PRIORITY_HEARTBEAT)
@@ -559,6 +587,14 @@ class MixerProtocol(asyncio.Protocol):
             Dictionary mapping line input ID (1-8) to enabled status (True/False)
         """
         return self._group_line_inputs_map.get(group_id, {}).copy()
+
+    def get_group_volume_level(self, group_id: int):
+        """Get the volume level for a group.
+        
+        Returns:
+            Volume level (int 0-61) or "mute" or None if not known
+        """
+        return self._group_volume_map.get(group_id)
 
     def get_status_of_all_zones(self) -> list[tuple[int, Optional[int]]]:
         return_list: list[tuple[int, int | None]] = []
