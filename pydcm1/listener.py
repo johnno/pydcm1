@@ -119,6 +119,10 @@ class MultiplexingListener(SourceChangeListener):
         for listener in self._listeners:
             listener.group_volume_changed(group_id, level)
 
+    def group_source_changed(self, group_id: int, source_id: int):
+        for listener in self._listeners:
+            listener.group_source_changed(group_id, source_id)
+
     def connected(self):
         for listener in self._listeners:
             listener.connected()

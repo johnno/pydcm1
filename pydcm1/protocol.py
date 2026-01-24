@@ -418,6 +418,18 @@ class MixerProtocol(asyncio.Protocol):
             self._logger.info(f"Group {group_id} volume: {level}")
             self._source_change_callback.group_volume_changed(group_id, level)
             return
+        
+        # Group source response: <g1.mu,s=7/>
+        group_source_match = GROUP_SOURCE_RESPONSE.match(message)
+        if group_source_match:
+            self._logger.debug(f"Group source response received: {message}")
+            group_id = int(group_source_match.group(1))
+            source_id = int(group_source_match.group(2))
+            self._group_to_source_map[group_id] = source_id
+            self._logger.info(f"Group {group_id} source: {source_id}")
+            # Notify callback
+            self._source_change_callback.group_source_changed(group_id, source_id)
+            return
 
         self._logger.debug(f"Unhandled message received: {message}")
 
