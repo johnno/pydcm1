@@ -81,12 +81,6 @@ class MixerProtocol(asyncio.Protocol):
         # Minimum delay between sends to avoid MCU serial port clashes (in seconds)
         self._min_send_delay: float = 0.1
 
-    def connect(self):
-        connection_task = self._loop.create_connection(
-            lambda: self, host=self._hostname, port=self._port
-        )
-        self._loop.create_task(connection_task)
-
     async def async_connect(self):
         transport, protocol = await self._loop.create_connection(
             lambda: self, host=self._hostname, port=self._port
@@ -182,13 +176,13 @@ class MixerProtocol(asyncio.Protocol):
                 )
 
     async def _wait_to_reconnect(self):
-        # TODO with the new async_connect I think we can make this much easier - but I can't test right now
-        # so not changing yet:
-        # await self.async_connect()
-        # using old sync connect.
+        """Attempt to reconnect after connection loss."""
         while not self._connected and self._reconnect:
             await asyncio.sleep(self._reconnect_time)
-            self.connect()
+            try:
+                await self.async_connect()
+            except Exception as e:
+                self._logger.warning(f"Reconnect attempt failed: {e}")
 
     def connection_lost(self, exc):
         """Method from asyncio.Protocol"""
