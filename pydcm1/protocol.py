@@ -50,7 +50,6 @@ class MixerProtocol(asyncio.Protocol):
         callback: SourceChangeListener,
         heartbeat_time=60,
         reconnect_time=10,
-        use_event_connection_for_commands=False,
         enable_heartbeat=True,
         command_confirmation=True,
     ):
@@ -61,7 +60,6 @@ class MixerProtocol(asyncio.Protocol):
         self._port = port
         self._source_change_callback = callback
         self._loop = asyncio.get_event_loop()
-        self._use_event_connection_for_commands = use_event_connection_for_commands
         self._enable_heartbeat = enable_heartbeat
         self._command_confirmation = command_confirmation
 
@@ -128,8 +126,8 @@ class MixerProtocol(asyncio.Protocol):
         """Worker task that processes all outgoing commands from the priority queue."""
         while True:
             try:
-                # Priority queue returns (priority, counter, (message, use_persistent, response_validator))
-                priority, counter, (message, use_persistent, response_validator) = await self._command_queue.get()
+                # Priority queue returns (priority, counter, (message, response_validator))
+                priority, counter, (message, response_validator) = await self._command_queue.get()
                 try:
                     # Enforce minimum delay between commands to avoid MCU serial port clashes
                     time_since_last_send = time.time() - self._last_send_time
@@ -138,14 +136,11 @@ class MixerProtocol(asyncio.Protocol):
                         self._logger.debug(f"Waiting {wait_time:.2f}s before sending command")
                         await asyncio.sleep(wait_time)
                     
-                    if use_persistent:
-                        if self._transport and self._connected:
-                            self._logger.debug(f"data_send persistent: {message.encode()}")
-                            self._transport.write(message.encode())
-                        else:
-                            self._logger.warning("Cannot send on persistent connection: not connected")
+                    if self._transport and self._connected:
+                        self._logger.debug(f"data_send persistent: {message.encode()}")
+                        self._transport.write(message.encode())
                     else:
-                        await self._send_ephemeral_internal(message, response_validator)
+                        self._logger.warning("Cannot send on persistent connection: not connected")
                     
                     self._last_send_time = time.time()
                 except Exception as e:
@@ -169,10 +164,10 @@ class MixerProtocol(asyncio.Protocol):
             for zone_id in range(1, self._zone_count + 1):
                 # Query volume level with low priority
                 self._command_counter += 1
-                await self._command_queue.put((PRIORITY_HEARTBEAT, self._command_counter, (f"<Z{zone_id}.MU,LQ/>\r", True, None)))
+                await self._command_queue.put((PRIORITY_HEARTBEAT, self._command_counter, (f"<Z{zone_id}.MU,LQ/>\r", None)))
                 # Query source with low priority
                 self._command_counter += 1
-                await self._command_queue.put((PRIORITY_HEARTBEAT, self._command_counter, (f"<Z{zone_id}.MU,SQ/>\r", True, None)))
+                await self._command_queue.put((PRIORITY_HEARTBEAT, self._command_counter, (f"<Z{zone_id}.MU,SQ/>\r", None)))
 
     async def _wait_to_reconnect(self):
         """Attempt to reconnect after connection loss."""
@@ -234,103 +229,6 @@ class MixerProtocol(asyncio.Protocol):
                 self._logger.debug(f"Whole message: {message}")
                 self._process_received_packet(message)
 
-    def _data_send(self, message: str, response_validator: Optional[Callable[[str], bool]] = None, priority: int = PRIORITY_USER_COMMAND):
-        """Queue a command to be sent (either persistent or ephemeral based on config).
-        
-        Args:
-            message: The message to send
-            response_validator: Optional function that returns True if response is valid
-            priority: Command priority (lower = higher priority, default=user commands)
-        """
-        use_persistent = self._use_event_connection_for_commands
-        try:
-            self._command_counter += 1
-            self._command_queue.put_nowait((priority, self._command_counter, (message, use_persistent, response_validator)))
-        except asyncio.QueueFull:
-            self._logger.error("Command queue is full, dropping command")
-
-    async def _send_ephemeral_internal(self, message, response_validator: Optional[Callable[[str], bool]] = None):
-        """Send a command via ephemeral connection. Called by command worker only."""
-        self._logger.debug(f"Ephemeral: Opening connection for command: {message.encode()}")
-        
-        try:
-            # Create protocol handler for this connection to receive responses
-            response_received = asyncio.Event()
-            response_data = {"matched": False, "messages": []}
-            
-            class EphemeralProtocol(asyncio.Protocol):
-                def __init__(self, response_received, response_data, logger, validator):
-                    self._response_received = response_received
-                    self._response_data = response_data
-                    self._logger = logger
-                    self._validator = validator
-                    self._buffer = ""
-                
-                def data_received(self, data):
-                    self._logger.debug(f"Ephemeral: Received data: {data}")
-                    for letter in data:
-                        if letter != ord("\r") and letter != ord("\n"):
-                            self._buffer += chr(letter)
-                        if letter == ord("\n"):
-                            msg = self._buffer
-                            self._buffer = ""
-                            self._response_data["messages"].append(msg)
-                            self._logger.debug(f"Ephemeral: Parsed message: '{msg}'")
-                            
-                            # Validate response if validator provided
-                            if self._validator:
-                                if self._validator(msg):
-                                    self._logger.info(f"Ephemeral: Command succeeded: '{msg}'")
-                                    self._response_data["matched"] = True
-                                    self._response_received.set()
-                                else:
-                                    self._logger.debug(f"Ephemeral: Unexpected response (not a success): '{msg}'")
-                            else:
-                                # No validator, can't determine success/failure
-                                self._logger.debug(f"Ephemeral: Response received (no success validation configured): '{msg}'")
-                                self._response_received.set()
-            
-            transport, protocol = await self._loop.create_connection(
-                lambda: EphemeralProtocol(response_received, response_data, self._logger, response_validator),
-                host=self._hostname,
-                port=self._port
-            )
-            self._logger.debug(f"Ephemeral: Connection established")
-            
-            # Send the command immediately (no prompt to wait for)
-            self._logger.debug(f"Ephemeral: Writing to transport: {message.encode()}")
-            transport.write(message.encode())
-            self._logger.debug(f"Ephemeral: Data written to transport")
-            
-            # Give a tiny delay to ensure write buffer is flushed before we start monitoring
-            await asyncio.sleep(0.01)
-            
-            # Monitor for responses after sending command - exit early when received
-            monitor_time = 2.0
-            self._logger.debug(f"Ephemeral: Monitoring connection for up to {monitor_time}s for response")
-            start_time = time.time()
-            
-            try:
-                await asyncio.wait_for(response_received.wait(), timeout=monitor_time)
-                elapsed = time.time() - start_time
-                self._logger.debug(f"Ephemeral: Response received after {elapsed:.2f}s")
-            except asyncio.TimeoutError:
-                elapsed = time.time() - start_time
-                self._logger.warning(f"Ephemeral: No response received after sending command (waited {elapsed:.2f}s)")
-            
-            # Log all messages received
-            if response_data['messages']:
-                self._logger.debug(
-                    f"Ephemeral: Received {len(response_data['messages'])} message(s): {response_data['messages']}"
-                )
-            
-            self._logger.debug(f"Ephemeral: Closing connection after {elapsed:.2f}s")
-            transport.close()
-            self._logger.debug(f"Ephemeral: Connection closed")
-            
-        except Exception as e:
-            self._logger.error(f"Ephemeral: Error in ephemeral connection: {e}")
-
     def _data_send_persistent(self, message, priority: int = PRIORITY_USER_COMMAND):
         """Queue a command to be sent via the persistent connection.
         
@@ -340,7 +238,7 @@ class MixerProtocol(asyncio.Protocol):
         """
         try:
             self._command_counter += 1
-            self._command_queue.put_nowait((priority, self._command_counter, (message, True, None)))
+            self._command_queue.put_nowait((priority, self._command_counter, (message, None)))
         except asyncio.QueueFull:
             self._logger.error("Command queue is full, dropping command")
 
