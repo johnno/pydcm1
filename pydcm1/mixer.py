@@ -133,6 +133,12 @@ class DCM1Mixer:
     def update_status(self):
         self.protocol.send_zone_source_query_messages()
 
+    def query_all_labels(self):
+        """Query all zone and source labels from the device."""
+        self.protocol.send_zone_label_query_messages()
+        self.protocol.send_source_label_query_messages()
+        self.protocol.send_volume_level_query_messages()
+
     def status_of_zone(self, zone_id: int) -> Optional[int]:
         return self.protocol.get_status_of_zone(zone_id)
 
