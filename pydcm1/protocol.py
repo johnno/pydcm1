@@ -111,6 +111,9 @@ class MixerProtocol(asyncio.Protocol):
         # Group volume debouncing: maps group_id -> (pending_level, debounce_task)
         self._group_volume_debounce: dict[int, tuple[Any, Task[Any]]] = {}
         self._volume_debounce_delay: float = 0.5  # Wait 500ms after last request before sending
+        # Track confirmation tasks to cancel them when new requests arrive
+        self._zone_volume_confirm_task: dict[int, Task[Any]] = {}
+        self._group_volume_confirm_task: dict[int, Task[Any]] = {}
 
     async def async_connect(self):
         transport, protocol = await self._loop.create_connection(
@@ -527,6 +530,13 @@ class MixerProtocol(asyncio.Protocol):
                 old_task.cancel()
                 self._logger.debug(f"Cancelled pending volume command for zone {zone_id} (was set to {old_level})")
         
+        # Cancel any pending confirmation task for this zone (prevents race conditions)
+        if zone_id in self._zone_volume_confirm_task:
+            old_confirm_task = self._zone_volume_confirm_task[zone_id]
+            if old_confirm_task and not old_confirm_task.done():
+                old_confirm_task.cancel()
+                self._logger.debug(f"Cancelled pending volume confirmation for zone {zone_id}")
+        
         # Create a new debounce task that will send the command after a delay
         debounce_task = self._loop.create_task(
             self._debounce_volume_command(zone_id, level_str, expected_level)
@@ -558,9 +568,10 @@ class MixerProtocol(asyncio.Protocol):
             self._logger.info(f"Queueing debounced volume command: {command.encode()}")
             self._data_send_persistent(command)
             
-            # Auto-confirm if enabled
+            # Auto-confirm if enabled - track the task so it can be cancelled if needed
             if self._command_confirmation:
-                self._loop.create_task(self._confirm_volume(zone_id, expected_level))
+                confirm_task = self._loop.create_task(self._confirm_volume(zone_id, expected_level))
+                self._zone_volume_confirm_task[zone_id] = confirm_task
             
             # Clean up debounce tracker
             if zone_id in self._zone_volume_debounce:
@@ -596,9 +607,10 @@ class MixerProtocol(asyncio.Protocol):
             self._logger.info(f"Queueing debounced volume command: {command.encode()}")
             self._data_send_persistent(command)
             
-            # Auto-confirm if enabled
+            # Auto-confirm if enabled - track the task so it can be cancelled if needed
             if self._command_confirmation:
-                self._loop.create_task(self._confirm_group_volume(group_id, expected_level))
+                confirm_task = self._loop.create_task(self._confirm_group_volume(group_id, expected_level))
+                self._group_volume_confirm_task[group_id] = confirm_task
             
             # Clean up debounce tracker
             if group_id in self._group_volume_debounce:
@@ -673,6 +685,13 @@ class MixerProtocol(asyncio.Protocol):
             if old_task and not old_task.done():
                 old_task.cancel()
                 self._logger.debug(f"Cancelled pending volume command for group {group_id} (was set to {old_level})")
+        
+        # Cancel any pending confirmation task for this group (prevents race conditions)
+        if group_id in self._group_volume_confirm_task:
+            old_confirm_task = self._group_volume_confirm_task[group_id]
+            if old_confirm_task and not old_confirm_task.done():
+                old_confirm_task.cancel()
+                self._logger.debug(f"Cancelled pending volume confirmation for group {group_id}")
         
         # Create a new debounce task that will send the command after a delay
         debounce_task = self._loop.create_task(
