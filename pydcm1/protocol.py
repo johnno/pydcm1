@@ -99,6 +99,7 @@ class MixerProtocol(asyncio.Protocol):
         self._command_queue: PriorityQueue = PriorityQueue()
         self._command_counter: int = 0  # Counter for FIFO order within same priority
         self._command_worker_task: Optional[Task[Any]] = None
+        self._connection_watchdog_task: Optional[Task[Any]] = None  # Monitor connection health
         # Track last send time to avoid clashes between commands
         self._last_send_time: float = 0.0
         # Track last received data time to detect silent/stalled connections
@@ -121,10 +122,20 @@ class MixerProtocol(asyncio.Protocol):
         # Track source confirmation tasks to cancel them when new requests arrive
         self._zone_source_confirm_task: dict[int, Task[Any]] = {}
         self._group_source_confirm_task: dict[int, Task[Any]] = {}
-        # Track pending user commands that have been sent but not yet confirmed
+        # Track user commands that have been sent but not yet confirmed (inflight)
         # Format: counter -> (priority, message)
         # Used for recovery on reconnection - only user commands, not heartbeat queries
-        self._pending_sends: dict[int, tuple[int, str]] = {}
+        self._inflight_sends: dict[int, tuple[int, str]] = {}
+        # If connection is down for longer than this, clear inflight sends on reconnect
+        # because users may have used the front panel and our commands are now stale
+        self._clear_queue_after_reconnection_delay_seconds: float = 60.0
+        # Track when connection was lost to detect long downtime
+        self._connection_lost_time: Optional[float] = None
+        # Retry inflight commands on confirmation failures due to shared serial line interference
+        self._retry_on_confirmation_timeout: bool = True  # Retry if no response from device
+        self._retry_on_confirmation_mismatch: bool = True  # TODO: Retry if response has wrong value
+        self._inflight_retry_count: dict[int, int] = {}  # Track retry attempts per command
+        self._max_retries: int = 1  # Max retry attempts per command
 
     async def async_connect(self):
         transport, protocol = await self._loop.create_connection(
@@ -151,12 +162,74 @@ class MixerProtocol(asyncio.Protocol):
         if self._heartbeat_task is not None and not self._heartbeat_task.done():
             self._heartbeat_task.cancel()
         
-        # Re-queue any pending user commands that were sent but not confirmed before disconnect
-        if self._pending_sends:
-            self._logger.warning(f"Re-queueing {len(self._pending_sends)} pending user commands after reconnection")
-            # Sort by counter to maintain FIFO order within pending sends
-            for counter in sorted(self._pending_sends.keys()):
-                priority, message = self._pending_sends[counter]
+        # Check if connection was down for a long time
+        # If so, inflight commands are likely stale (user may have used front panel)
+        should_queue_inflight = True
+        if self._connection_lost_time is not None:
+            downtime = time.time() - self._connection_lost_time
+            if downtime > self._clear_queue_after_reconnection_delay_seconds:
+                self._logger.warning(
+                    f"Connection was down for {downtime:.1f}s (threshold: {self._clear_queue_after_reconnection_delay_seconds}s), "
+                    f"clearing {len(self._inflight_sends)} stale inflight sends and debounce/confirmation tasks"
+                )
+                # Clear inflight sends tracking
+                self._inflight_sends.clear()
+                
+                # Cancel and clear all mid-flight debounce tasks (both volume and source, both zones and groups)
+                for task in self._zone_volume_debounce.values():
+                    _, debounce_task = task
+                    if debounce_task and not debounce_task.done():
+                        debounce_task.cancel()
+                self._zone_volume_debounce.clear()
+                
+                for task in self._group_volume_debounce.values():
+                    _, debounce_task = task
+                    if debounce_task and not debounce_task.done():
+                        debounce_task.cancel()
+                self._group_volume_debounce.clear()
+                
+                for task in self._zone_source_debounce.values():
+                    _, debounce_task = task
+                    if debounce_task and not debounce_task.done():
+                        debounce_task.cancel()
+                self._zone_source_debounce.clear()
+                
+                for task in self._group_source_debounce.values():
+                    _, debounce_task = task
+                    if debounce_task and not debounce_task.done():
+                        debounce_task.cancel()
+                self._group_source_debounce.clear()
+                
+                # Cancel and clear all mid-flight confirmation tasks (both volume and source, both zones and groups)
+                for task in self._zone_volume_confirm_task.values():
+                    if task and not task.done():
+                        task.cancel()
+                self._zone_volume_confirm_task.clear()
+                
+                for task in self._group_volume_confirm_task.values():
+                    if task and not task.done():
+                        task.cancel()
+                self._group_volume_confirm_task.clear()
+                
+                for task in self._zone_source_confirm_task.values():
+                    if task and not task.done():
+                        task.cancel()
+                self._zone_source_confirm_task.clear()
+                
+                for task in self._group_source_confirm_task.values():
+                    if task and not task.done():
+                        task.cancel()
+                self._group_source_confirm_task.clear()
+                
+                should_queue_inflight = False
+            self._connection_lost_time = None
+        
+        # Re-queue any inflight user commands that were sent but not confirmed before disconnect
+        if should_queue_inflight and self._inflight_sends:
+            self._logger.warning(f"Re-queueing {len(self._inflight_sends)} inflight user commands after reconnection")
+            # Sort by counter to maintain FIFO order within inflight sends
+            for counter in sorted(self._inflight_sends.keys()):
+                priority, message = self._inflight_sends[counter]
                 self._logger.info(f"Re-queueing pending command #{counter}: {message.strip()}")
                 try:
                     self._command_queue.put_nowait((priority, counter, (message, None)))
@@ -167,6 +240,9 @@ class MixerProtocol(asyncio.Protocol):
         self._command_worker_task = self._loop.create_task(self._command_worker())
         if self._enable_heartbeat:
             self._heartbeat_task = self._loop.create_task(self._heartbeat())
+        
+        # Start connection watchdog to detect silent disconnections
+        self._connection_watchdog_task = self._loop.create_task(self._connection_watchdog())
         
         # Query zone/source labels, volume levels, and current sources
         self.send_zone_label_query_messages()
@@ -196,10 +272,16 @@ class MixerProtocol(asyncio.Protocol):
                         # Track user commands for recovery on reconnection
                         # Heartbeat queries (priority 20) don't need tracking - they're regenerated
                         if priority == PRIORITY_USER_COMMAND:
-                            self._pending_sends[counter] = (priority, message)
-                            self._logger.debug(f"Tracking pending send: Command #{counter}")
+                            self._inflight_sends[counter] = (priority, message)
+                            self._logger.debug(f"Tracking inflight send: Command #{counter}")
+                            # Remove any older inflight commands for the same zone/group to avoid resending superseded commands
+                            self._debounce_inflight_sends(counter, message)
                     else:
                         self._logger.error(f"SEND FAILED: Command #{counter} - not connected (transport={self._transport is not None}, connected={self._connected})")
+                        # Connection is definitely down - trigger immediate reconnection
+                        # Don't wait for watchdog or connection_lost() callback
+                        if self._connected:  # Only if we haven't already marked it as disconnected
+                            self._handle_connection_broken()
                     
                     self._last_send_time = time.time()
                 except Exception as e:
@@ -238,6 +320,47 @@ class MixerProtocol(asyncio.Protocol):
                 self._command_counter += 1
                 await self._command_queue.put((PRIORITY_HEARTBEAT, self._command_counter, (f"<G{group_id}.MU,SQ/>\r", None)))
 
+    async def _connection_watchdog(self):
+        """Monitor connection health and trigger reconnection if connection dies silently.
+        
+        asyncio's connection_lost() callback is not always reliable for detecting all
+        connection breaks. This watchdog detects if no data has been received for a
+        long time and manually triggers reconnection.
+        """
+        idle_timeout = 30.0  # Consider connection dead if no data for 30 seconds
+        check_interval = 5.0  # Check every 5 seconds
+        
+        while self._reconnect:
+            try:
+                await asyncio.sleep(check_interval)
+                
+                if self._connected:
+                    # Check if connection appears to be silent (no data received)
+                    time_since_last_data = time.time() - self._last_received_time
+                    
+                    if time_since_last_data > idle_timeout:
+                        # Connection appears to be dead - the device isn't responding
+                        # Manually trigger reconnection since connection_lost() may not be called
+                        # NOTE: This is a FALLBACK detection. The send failure handler should have
+                        # detected disconnection immediately on first failed command (~milliseconds),
+                        # and heartbeat queries should have detected it within ~10 seconds.
+                        # If watchdog is triggering, primary detection mechanisms failed or are disabled.
+                        self._logger.error(
+                            f"[WATCHDOG FALLBACK] Connection appears dead: no data received for {time_since_last_data:.1f}s "
+                            f"(send failure handler or heartbeat should have detected this earlier), reconnecting..."
+                        )
+                        self._connected = False
+                        if self._transport:
+                            self._transport.close()
+                        # Schedule reconnection
+                        await self._wait_to_reconnect()
+                        return  # Exit watchdog, it will be restarted on next connection
+            except asyncio.CancelledError:
+                self._logger.debug("Connection watchdog cancelled")
+                break
+            except Exception as e:
+                self._logger.error(f"Error in connection watchdog: {e}")
+
     async def _wait_to_reconnect(self):
         """Attempt to reconnect after connection loss."""
         while not self._connected and self._reconnect:
@@ -249,11 +372,23 @@ class MixerProtocol(asyncio.Protocol):
 
     def connection_lost(self, exc):
         """Method from asyncio.Protocol"""
+        self._handle_connection_broken()
+
+    def _handle_connection_broken(self):
+        """Handle connection loss - called either by asyncio callback or by send failure detection.
+        
+        This centralizes disconnection logic so it triggers immediately on detection,
+        not delayed by timeouts or unreliable callbacks.
+        """
         self._connected = False
+        # Record when the connection was lost (for detecting long downtimes)
+        self._connection_lost_time = time.time()
         if self._heartbeat_task is not None:
             self._heartbeat_task.cancel()
         if self._command_worker_task is not None:
             self._command_worker_task.cancel()
+        if hasattr(self, '_connection_watchdog_task') and self._connection_watchdog_task is not None:
+            self._connection_watchdog_task.cancel()
         disconnected_message = f"Disconnected from {self._hostname}"
         if self._reconnect:
             disconnected_message = (
@@ -265,10 +400,16 @@ class MixerProtocol(asyncio.Protocol):
             disconnected_message = disconnected_message + " not reconnecting"
             # Only info in here as close has been called.
             self._logger.info(disconnected_message)
-        self._source_change_callback.disconnected()
+        
+        # Notify callback, but don't let callback exceptions prevent reconnection
+        try:
+            self._source_change_callback.disconnected()
+        except Exception as e:
+            self._logger.error(f"Exception in disconnected() callback: {e}")
+        
+        # Always attempt reconnection if enabled, even if callback failed
         if self._reconnect:
             self._loop.create_task(self._wait_to_reconnect())
-        pass
 
     def data_received(self, data):
         """Method from asyncio.Protocol"""
@@ -979,36 +1120,119 @@ class MixerProtocol(asyncio.Protocol):
         # Might be <Z1.MU,M/> to mute?
         self._logger.warning("Mute control not yet implemented for DCM1")
 
-    def _clear_pending_send(self, counter: int):
-        """Clear a pending send from tracking after successful confirmation.
+    def _clear_inflight_send(self, counter: int):
+        """Clear an inflight send from tracking after successful confirmation.
         
         Args:
-            counter: Command counter to clear from pending sends
+            counter: Command counter to clear from inflight sends
         """
-        if counter in self._pending_sends:
-            del self._pending_sends[counter]
-            self._logger.debug(f"Cleared pending send: Command #{counter}")
+        if counter in self._inflight_sends:
+            del self._inflight_sends[counter]
+            self._logger.debug(f"Cleared inflight send: Command #{counter}")
+        # Clean up retry count when command is confirmed
+        if counter in self._inflight_retry_count:
+            del self._inflight_retry_count[counter]
     
-    def _clear_all_pending_sends_by_pattern(self, pattern: str):
-        """Clear pending sends matching a command pattern (e.g., volume change for zone 1).
+    def _retry_inflight_send(self, counter: int) -> bool:
+        """Attempt to retry an inflight send that failed confirmation.
         
-        Used when a command is confirmed - removes matching pending sends from recovery tracking.
+        Handles shared serial line interference by re-queuing failed commands.
+        Only retries if max retries not exceeded.
+        
+        Args:
+            counter: Command counter to retry
+            
+        Returns:
+            True if retry was attempted, False if max retries exceeded or command not found
+        """
+        if counter not in self._inflight_sends:
+            self._logger.warning(f"Cannot retry: command #{counter} not in inflight_sends")
+            return False
+        
+        retry_count = self._inflight_retry_count.get(counter, 0)
+        if retry_count >= self._max_retries:
+            self._logger.error(f"Max retries ({self._max_retries}) exceeded for command #{counter}, giving up")
+            return False
+        
+        priority, message = self._inflight_sends[counter]
+        self._logger.warning(f"Retrying failed command #{counter} (attempt {retry_count + 1}/{self._max_retries}): {message.strip()}")
+        self._inflight_retry_count[counter] = retry_count + 1
+        
+        try:
+            self._command_queue.put_nowait((priority, counter, (message, None)))
+            return True
+        except asyncio.QueueFull:
+            self._logger.error(f"Queue full, could not retry command #{counter}")
+            return False
+    
+    def _clear_all_inflight_sends_by_pattern(self, pattern: str):
+        """Clear inflight sends matching a command pattern (e.g., volume change for zone 1).
+        
+        Used when a command is confirmed - removes matching inflight sends from recovery tracking.
         This assumes most recent matching command was the one that was confirmed.
         
         Args:
             pattern: Part of the command string to match (e.g., "<Z1.MU,L" for zone 1 volume)
         """
-        # Find and remove the most recent pending send matching this pattern
+        # Find and remove the most recent inflight send matching this pattern
         to_remove = []
-        for counter in sorted(self._pending_sends.keys(), reverse=True):
-            _, message = self._pending_sends[counter]
+        for counter in sorted(self._inflight_sends.keys(), reverse=True):
+            _, message = self._inflight_sends[counter]
             if pattern in message:
                 to_remove.append(counter)
-                self._logger.debug(f"Clearing confirmed pending send: Command #{counter} matching {pattern}")
+                self._logger.debug(f"Clearing confirmed inflight send: Command #{counter} matching {pattern}")
                 break  # Only clear the most recent one (most likely to be the confirmed command)
         
         for counter in to_remove:
-            del self._pending_sends[counter]
+            del self._inflight_sends[counter]
+
+    def _debounce_inflight_sends(self, counter: int, message: str):
+        """Remove older inflight commands for the same zone/group AND command type.
+        
+        Keeps latest command for each (zone, command_type) or (group, command_type) pair.
+        Volume and source changes are independent: sending Vol 47 then Vol 42 to zone 1
+        keeps only #2, but sending Vol 42 then Source 5 to zone 1 keeps both.
+        
+        Args:
+            counter: Command counter being added to inflight sends
+            message: Command message (e.g., "<Z1.MU,L42/>\r" or "<Z1.MU,S5/>\r")
+        """
+        import re
+        # Extract zone/group and command type
+        # Format: <Z1.MU,L42/> (volume) or <Z1.MU,S5/> (source) or <G1.MU,L.../> or <G1.MU,S.../>
+        zone_vol_match = re.search(r'<Z(\d+)\.MU,L', message)
+        zone_src_match = re.search(r'<Z(\d+)\.MU,S', message)
+        group_vol_match = re.search(r'<G(\d+)\.MU,L', message)
+        group_src_match = re.search(r'<G(\d+)\.MU,S', message)
+        
+        if zone_vol_match:
+            zone_id = zone_vol_match.group(1)
+            pattern = f"<Z{zone_id}.MU,L"  # Only volume commands for this zone
+        elif zone_src_match:
+            zone_id = zone_src_match.group(1)
+            pattern = f"<Z{zone_id}.MU,S"  # Only source commands for this zone
+        elif group_vol_match:
+            group_id = group_vol_match.group(1)
+            pattern = f"<G{group_id}.MU,L"  # Only volume commands for this group
+        elif group_src_match:
+            group_id = group_src_match.group(1)
+            pattern = f"<G{group_id}.MU,S"  # Only source commands for this group
+        else:
+            return  # Unknown command format, don't debounce
+        
+        # Remove all older inflight sends matching the EXACT zone/group AND command type
+        to_remove = []
+        for old_counter in sorted(self._inflight_sends.keys()):
+            if old_counter >= counter:
+                continue  # Skip this command and newer ones
+            _, old_message = self._inflight_sends[old_counter]
+            if pattern in old_message:
+                # Same zone/group AND same command type (both volume or both source)
+                to_remove.append(old_counter)
+                self._logger.debug(f"Removing superseded inflight send: Command #{old_counter} (newer #{counter} replaces it for {pattern})")
+        
+        for old_counter in to_remove:
+            del self._inflight_sends[old_counter]
 
     async def _confirm_volume(self, zone_id: int, expected_level: int):
         """Query volume after setting to confirm and broadcast to all listeners.
@@ -1028,53 +1252,69 @@ class MixerProtocol(asyncio.Protocol):
         # Wait for QUERY to be sent (0.1s min delay) + network + DCM1 response + processing
         await asyncio.sleep(0.5)
         
+        # Get the inflight command counter for potential retry
+        # Find the matching inflight command for this zone volume change
+        matching_counter = None
+        for counter in sorted(self._inflight_sends.keys(), reverse=True):
+            _, message = self._inflight_sends[counter]
+            if f"<Z{zone_id}.MU,L" in message:
+                matching_counter = counter
+                break
+        
         # Check if the volume matches expected
         actual_level = self.get_volume_level(zone_id)
         if actual_level is None:
+            # No response - timeout
             self._logger.warning(f"Volume confirmation: no response received for zone {zone_id}")
+            if self._retry_on_confirmation_timeout and matching_counter is not None:
+                self._retry_inflight_send(matching_counter)
             return
 
         # Handle mute cases first
         if actual_level == "mute":
             if expected_level == 62:
                 self._logger.info(f"Volume confirmation: zone {zone_id} muted successfully")
-                self._clear_all_pending_sends_by_pattern(f"<Z{zone_id}.MU,L")
+                self._clear_all_inflight_sends_by_pattern(f"<Z{zone_id}.MU,L")
                 return
             # Retry once if we expected a number but read mute (device can lag)
             self._logger.debug(
-                f"Volume mismatch (got mute), retrying once: zone {zone_id} expected {expected_level}"
+                f"Volume mismatch (got mute), retrying query once: zone {zone_id} expected {expected_level}"
             )
             self._data_send_persistent(f"<Z{zone_id}.MU,LQ/>\r")
             await asyncio.sleep(0.4)
             retry_level = self.get_volume_level(zone_id)
             if retry_level == expected_level:
                 self._logger.info(f"Volume confirmation: zone {zone_id} set to {retry_level} after retry")
-                self._clear_all_pending_sends_by_pattern(f"<Z{zone_id}.MU,L")
+                self._clear_all_inflight_sends_by_pattern(f"<Z{zone_id}.MU,L")
             else:
+                # Value mismatch after retry
                 self._logger.warning(
                     f"Volume mismatch: zone {zone_id} set to {expected_level}, got {retry_level if retry_level is not None else 'no response'}"
                 )
+                # TODO: Implement retry_on_confirmation_mismatch - re-send the command if flag is enabled
             return
 
         # Numeric levels
         if isinstance(actual_level, int) and actual_level != expected_level:
-            # Retry once before warning
+            # Retry once before giving up
             self._logger.debug(
-                f"Volume mismatch (first read {actual_level}), retrying once: zone {zone_id} expected {expected_level}"
+                f"Volume mismatch (first read {actual_level}), retrying query once: zone {zone_id} expected {expected_level}"
             )
             self._data_send_persistent(f"<Z{zone_id}.MU,LQ/>\r")
             await asyncio.sleep(0.4)
             retry_level = self.get_volume_level(zone_id)
             if retry_level == expected_level:
                 self._logger.info(f"Volume confirmation: zone {zone_id} set to {retry_level} after retry")
-                self._clear_all_pending_sends_by_pattern(f"<Z{zone_id}.MU,L")
+                self._clear_all_inflight_sends_by_pattern(f"<Z{zone_id}.MU,L")
             else:
+                # Value mismatch after retry
                 self._logger.warning(
                     f"Volume mismatch: zone {zone_id} set to {expected_level}, got {retry_level if retry_level is not None else actual_level}"
                 )
+                # TODO: Implement retry_on_confirmation_mismatch - re-send the command if flag is enabled
         else:
             self._logger.info(f"Volume confirmation: zone {zone_id} set to {actual_level} successfully")
-            self._clear_all_pending_sends_by_pattern(f"<Z{zone_id}.MU,L")
+            self._clear_all_inflight_sends_by_pattern(f"<Z{zone_id}.MU,L")
 
     async def _confirm_source(self, zone_id: int, expected_source: int):
         """Query source after setting to confirm and broadcast to all listeners.
@@ -1094,15 +1334,28 @@ class MixerProtocol(asyncio.Protocol):
         # Wait for QUERY to be sent (0.1s min delay) + network + DCM1 response + processing
         await asyncio.sleep(0.5)
         
+        # Get the inflight command counter for potential retry
+        matching_counter = None
+        for counter in sorted(self._inflight_sends.keys(), reverse=True):
+            _, message = self._inflight_sends[counter]
+            if f"<Z{zone_id}.MU,S" in message:
+                matching_counter = counter
+                break
+        
         # Check if the source matches expected
         actual_source = self.get_status_of_zone(zone_id)
         if actual_source is None:
+            # No response - timeout
             self._logger.warning(f"Source confirmation: no response received for zone {zone_id}")
+            if self._retry_on_confirmation_timeout and matching_counter is not None:
+                self._retry_inflight_send(matching_counter)
         elif actual_source != expected_source:
+            # Value mismatch
             self._logger.warning(f"Source mismatch: zone {zone_id} set to {expected_source}, got {actual_source}")
+            # TODO: Implement retry_on_confirmation_mismatch - re-send the command if flag is enabled
         else:
             self._logger.info(f"Source confirmation: zone {zone_id} set to source {actual_source} successfully")
-            self._clear_all_pending_sends_by_pattern(f"<Z{zone_id}.MU,S")
+            self._clear_all_inflight_sends_by_pattern(f"<Z{zone_id}.MU,S")
 
     async def _confirm_group_volume(self, group_id: int, expected_level: int):
         """Query group volume after setting to confirm and broadcast to all listeners.
@@ -1122,53 +1375,68 @@ class MixerProtocol(asyncio.Protocol):
         # Wait for QUERY to be sent (0.1s min delay) + network + DCM1 response + processing
         await asyncio.sleep(0.5)
         
+        # Get the inflight command counter for potential retry
+        matching_counter = None
+        for counter in sorted(self._inflight_sends.keys(), reverse=True):
+            _, message = self._inflight_sends[counter]
+            if f"<G{group_id}.MU,L" in message:
+                matching_counter = counter
+                break
+        
         # Check if the volume matches expected
         actual_level = self.get_group_volume_level(group_id)
         if actual_level is None:
+            # No response - timeout
             self._logger.warning(f"Volume confirmation: no response received for group {group_id}")
+            if self._retry_on_confirmation_timeout and matching_counter is not None:
+                self._retry_inflight_send(matching_counter)
             return
 
         # Handle mute cases first
         if actual_level == "mute":
             if expected_level == 62:
                 self._logger.info(f"Volume confirmation: group {group_id} muted successfully")
-                self._clear_all_pending_sends_by_pattern(f"<G{group_id}.MU,L")
+                self._clear_all_inflight_sends_by_pattern(f"<G{group_id}.MU,L")
                 return
             # Retry once if we expected a number but read mute (device can lag)
             self._logger.debug(
-                f"Volume mismatch (got mute), retrying once: group {group_id} expected {expected_level}"
+                f"Volume mismatch (got mute), retrying query once: group {group_id} expected {expected_level}"
             )
             self._data_send_persistent(f"<G{group_id}.MU,LQ/>\r")
             await asyncio.sleep(0.4)
             retry_level = self.get_group_volume_level(group_id)
             if retry_level == expected_level:
                 self._logger.info(f"Volume confirmation: group {group_id} set to {retry_level} after retry")
-                self._clear_all_pending_sends_by_pattern(f"<G{group_id}.MU,L")
+                self._clear_all_inflight_sends_by_pattern(f"<G{group_id}.MU,L")
             else:
+                # Value mismatch after retry
                 self._logger.warning(
                     f"Volume mismatch: group {group_id} set to {expected_level}, got {retry_level if retry_level is not None else 'no response'}"
                 )
+                # TODO: Implement retry_on_confirmation_mismatch - re-send the command if flag is enabled
             return
 
         # Numeric levels
         if isinstance(actual_level, int) and actual_level != expected_level:
-            # Retry once before warning
+            # Retry once before giving up
             self._logger.debug(
-                f"Volume mismatch (first read {actual_level}), retrying once: group {group_id} expected {expected_level}"
+                f"Volume mismatch (first read {actual_level}), retrying query once: group {group_id} expected {expected_level}"
             )
             self._data_send_persistent(f"<G{group_id}.MU,LQ/>\r")
             await asyncio.sleep(0.4)
             retry_level = self.get_group_volume_level(group_id)
             if retry_level == expected_level:
                 self._logger.info(f"Volume confirmation: group {group_id} set to {retry_level} after retry")
-                self._clear_all_pending_sends_by_pattern(f"<G{group_id}.MU,L")
+                self._clear_all_inflight_sends_by_pattern(f"<G{group_id}.MU,L")
             else:
+                # Value mismatch after retry
                 self._logger.warning(
                     f"Volume mismatch: group {group_id} set to {expected_level}, got {retry_level if retry_level is not None else actual_level}"
                 )
+                # TODO: Implement retry_on_confirmation_mismatch - re-send the command if flag is enabled
         else:
             self._logger.info(f"Volume confirmation: group {group_id} set to {actual_level} successfully")
-            self._clear_all_pending_sends_by_pattern(f"<G{group_id}.MU,L")
+            self._clear_all_inflight_sends_by_pattern(f"<G{group_id}.MU,L")
 
     async def _confirm_group_source(self, group_id: int, expected_source: int):
         """Query group source after setting to confirm and broadcast to all listeners.
@@ -1188,12 +1456,25 @@ class MixerProtocol(asyncio.Protocol):
         # Wait for QUERY to be sent (0.1s min delay) + network + DCM1 response + processing
         await asyncio.sleep(0.5)
         
+        # Get the inflight command counter for potential retry
+        matching_counter = None
+        for counter in sorted(self._inflight_sends.keys(), reverse=True):
+            _, message = self._inflight_sends[counter]
+            if f"<G{group_id}.MU,S" in message:
+                matching_counter = counter
+                break
+        
         # Check if the source matches expected
         actual_source = self.get_group_source(group_id)
         if actual_source is None:
+            # No response - timeout
             self._logger.warning(f"Source confirmation: no response received for group {group_id}")
+            if self._retry_on_confirmation_timeout and matching_counter is not None:
+                self._retry_inflight_send(matching_counter)
         elif actual_source != expected_source:
+            # Value mismatch
             self._logger.warning(f"Source mismatch: group {group_id} set to {expected_source}, got {actual_source}")
+            # TODO: Implement retry_on_confirmation_mismatch - re-send the command if flag is enabled
         else:
             self._logger.info(f"Source confirmation: group {group_id} set to source {actual_source} successfully")
-            self._clear_all_pending_sends_by_pattern(f"<G{group_id}.MU,S")
+            self._clear_all_inflight_sends_by_pattern(f"<G{group_id}.MU,S")
