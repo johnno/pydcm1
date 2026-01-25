@@ -108,6 +108,8 @@ class MixerProtocol(asyncio.Protocol):
         # Volume command debouncing: maps zone_id -> (pending_level, debounce_task)
         # This coalesces rapid volume changes into a single final command
         self._zone_volume_debounce: dict[int, tuple[Any, Task[Any]]] = {}
+        # Group volume debouncing: maps group_id -> (pending_level, debounce_task)
+        self._group_volume_debounce: dict[int, tuple[Any, Task[Any]]] = {}
         self._volume_debounce_delay: float = 0.5  # Wait 500ms after last request before sending
 
     async def async_connect(self):
@@ -569,6 +571,44 @@ class MixerProtocol(asyncio.Protocol):
             if zone_id in self._zone_volume_debounce:
                 del self._zone_volume_debounce[zone_id]
 
+    async def _debounce_group_volume_command(self, group_id: int, level_str: str, expected_level: int):
+        """Wait for debounce delay, then send group volume command if not superseded.
+        
+        Args:
+            group_id: Group ID (1-4)
+            level_str: Level as string (e.g. "47" or "62")
+            expected_level: Expected level after command (for confirmation)
+        """
+        try:
+            # Wait for debounce window to pass (no more rapid requests)
+            await asyncio.sleep(self._volume_debounce_delay)
+            
+            # Check if this task was cancelled (superseded by newer request)
+            if group_id in self._group_volume_debounce:
+                _, current_task = self._group_volume_debounce[group_id]
+                if current_task != asyncio.current_task():
+                    # This task was superseded; don't send
+                    self._logger.debug(f"Volume command for group {group_id} level {level_str} was superseded")
+                    return
+            
+            # Send the actual command
+            command = f"<G{group_id}.MU,L{level_str}/>\r"
+            self._logger.info(f"Queueing debounced volume command: {command.encode()}")
+            self._data_send_persistent(command)
+            
+            # Auto-confirm if enabled
+            if self._command_confirmation:
+                self._loop.create_task(self._confirm_group_volume(group_id, expected_level))
+            
+            # Clean up debounce tracker
+            if group_id in self._group_volume_debounce:
+                del self._group_volume_debounce[group_id]
+        except asyncio.CancelledError:
+            # Task was cancelled; another request superseded it
+            self._logger.debug(f"Debounce task for group {group_id} was cancelled")
+            if group_id in self._group_volume_debounce:
+                del self._group_volume_debounce[group_id]
+
     def send_group_source(self, source_id: int, group_id: int):
         """Set a group to use a specific source.
         
@@ -594,41 +634,51 @@ class MixerProtocol(asyncio.Protocol):
         self._data_send_persistent(command)
 
     def send_group_volume_level(self, group_id: int, level):
-        """Set volume level for a group.
+        """Set volume level for a group with debounce to prevent command collisions.
+        
+        Rapid consecutive volume commands are coalesced: only the final command is sent.
+        This prevents the issue where two volume changes queued back-to-back cause
+        the second command to override the first before it completes.
         
         Args:
             group_id: Group ID (1-4)
             level: Volume level - int (0-61 where 20 = -20dB, 62 for mute) or "mute"
         """
-        self._logger.info(
-            f"Setting group volume level - Group: {group_id} to level: {level}"
-        )
-        # DCM1 uses <GX.MU,LN/> to set group X to level N
-        # Example: <G1.MU,L21/> sets group 1 to -21dB
-        # Level 62 is mute: <G1.MU,L62/> mutes group 1
-        # Response: <g1.mu,l=21/> or <g1.mu,l=mute/>
+        # Validate inputs early
         if not (1 <= group_id <= 4):  # DCM1 has 4 groups
             self._logger.error(f"Invalid group_id {group_id}, must be 1-4")
             return
         
-        # Validate level
         if isinstance(level, str):
             if level.lower() != "mute":
                 self._logger.error(f"Invalid level string '{level}', must be 'mute' or integer 0-62")
                 return
             level_str = "62"  # Mute is level 62
+            expected_level = 62
         elif isinstance(level, int):
             if not (0 <= level <= 62):
                 self._logger.error(f"Invalid level {level}, must be 0-62 (62=mute)")
                 return
             level_str = str(level)
+            expected_level = level
         else:
             self._logger.error(f"Invalid level type {type(level)}, must be int or 'mute'")
             return
         
-        command = f"<G{group_id}.MU,L{level_str}/>\r"
-        self._logger.info(f"Queueing command: {command.encode()}")
-        self._data_send_persistent(command)
+        self._logger.info(f"Volume request - Group: {group_id} to level: {level} (debounced)")
+        
+        # Cancel any pending debounce timer for this group
+        if group_id in self._group_volume_debounce:
+            old_level, old_task = self._group_volume_debounce[group_id]
+            if old_task and not old_task.done():
+                old_task.cancel()
+                self._logger.debug(f"Cancelled pending volume command for group {group_id} (was set to {old_level})")
+        
+        # Create a new debounce task that will send the command after a delay
+        debounce_task = self._loop.create_task(
+            self._debounce_group_volume_command(group_id, level_str, expected_level)
+        )
+        self._group_volume_debounce[group_id] = (level, debounce_task)
 
     def send_zone_source_query_messages(self):
         self._logger.info(f"Sending status query messages for all zones")
@@ -860,3 +910,65 @@ class MixerProtocol(asyncio.Protocol):
             self._logger.warning(f"Source mismatch: zone {zone_id} set to {expected_source}, got {actual_source}")
         else:
             self._logger.info(f"Source confirmation: zone {zone_id} set to source {actual_source} successfully")
+
+    async def _confirm_group_volume(self, group_id: int, expected_level: int):
+        """Query group volume after setting to confirm and broadcast to all listeners.
+        
+        Args:
+            group_id: Group ID (1-4)
+            expected_level: Expected volume level (0-62, where 62=mute)
+        """
+        # Wait for SET command to be sent and processed by DCM1
+        # Min delay between sends is 0.1s, plus DCM1 processing time
+        await asyncio.sleep(0.3)
+        self._logger.debug(f"Confirming volume for group {group_id}, expected: {expected_level}")
+        
+        # Query the volume level - this will broadcast the response to all listeners
+        self._data_send_persistent(f"<G{group_id}.MU,LQ/>\r")
+        
+        # Wait for QUERY to be sent (0.1s min delay) + network + DCM1 response + processing
+        await asyncio.sleep(0.5)
+        
+        # Check if the volume matches expected
+        actual_level = self.get_group_volume_level(group_id)
+        if actual_level is None:
+            self._logger.warning(f"Volume confirmation: no response received for group {group_id}")
+            return
+
+        # Handle mute cases first
+        if actual_level == "mute":
+            if expected_level == 62:
+                self._logger.info(f"Volume confirmation: group {group_id} muted successfully")
+                return
+            # Retry once if we expected a number but read mute (device can lag)
+            self._logger.debug(
+                f"Volume mismatch (got mute), retrying once: group {group_id} expected {expected_level}"
+            )
+            self._data_send_persistent(f"<G{group_id}.MU,LQ/>\r")
+            await asyncio.sleep(0.4)
+            retry_level = self.get_group_volume_level(group_id)
+            if retry_level == expected_level:
+                self._logger.info(f"Volume confirmation: group {group_id} set to {retry_level} after retry")
+            else:
+                self._logger.warning(
+                    f"Volume mismatch: group {group_id} set to {expected_level}, got {retry_level if retry_level is not None else 'no response'}"
+                )
+            return
+
+        # Numeric levels
+        if isinstance(actual_level, int) and actual_level != expected_level:
+            # Retry once before warning
+            self._logger.debug(
+                f"Volume mismatch (first read {actual_level}), retrying once: group {group_id} expected {expected_level}"
+            )
+            self._data_send_persistent(f"<G{group_id}.MU,LQ/>\r")
+            await asyncio.sleep(0.4)
+            retry_level = self.get_group_volume_level(group_id)
+            if retry_level == expected_level:
+                self._logger.info(f"Volume confirmation: group {group_id} set to {retry_level} after retry")
+            else:
+                self._logger.warning(
+                    f"Volume mismatch: group {group_id} set to {expected_level}, got {retry_level if retry_level is not None else actual_level}"
+                )
+        else:
+            self._logger.info(f"Volume confirmation: group {group_id} set to {actual_level} successfully")
