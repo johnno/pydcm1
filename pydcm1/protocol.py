@@ -121,6 +121,10 @@ class MixerProtocol(asyncio.Protocol):
         # Track source confirmation tasks to cancel them when new requests arrive
         self._zone_source_confirm_task: dict[int, Task[Any]] = {}
         self._group_source_confirm_task: dict[int, Task[Any]] = {}
+        # Track pending user commands that have been sent but not yet confirmed
+        # Format: counter -> (priority, message)
+        # Used for recovery on reconnection - only user commands, not heartbeat queries
+        self._pending_sends: dict[int, tuple[int, str]] = {}
 
     async def async_connect(self):
         transport, protocol = await self._loop.create_connection(
@@ -146,6 +150,18 @@ class MixerProtocol(asyncio.Protocol):
             self._command_worker_task.cancel()
         if self._heartbeat_task is not None and not self._heartbeat_task.done():
             self._heartbeat_task.cancel()
+        
+        # Re-queue any pending user commands that were sent but not confirmed before disconnect
+        if self._pending_sends:
+            self._logger.warning(f"Re-queueing {len(self._pending_sends)} pending user commands after reconnection")
+            # Sort by counter to maintain FIFO order within pending sends
+            for counter in sorted(self._pending_sends.keys()):
+                priority, message = self._pending_sends[counter]
+                self._logger.info(f"Re-queueing pending command #{counter}: {message.strip()}")
+                try:
+                    self._command_queue.put_nowait((priority, counter, (message, None)))
+                except asyncio.QueueFull:
+                    self._logger.error(f"Queue full, could not re-queue pending command #{counter}")
         
         # Start command worker and heartbeat tasks
         self._command_worker_task = self._loop.create_task(self._command_worker())
@@ -176,6 +192,12 @@ class MixerProtocol(asyncio.Protocol):
                         self._logger.info(f"SEND: Command #{counter} (priority={priority}): {message.encode()}")
                         self._transport.write(message.encode())
                         self._logger.info(f"SEND: Command #{counter} written to transport successfully")
+                        
+                        # Track user commands for recovery on reconnection
+                        # Heartbeat queries (priority 20) don't need tracking - they're regenerated
+                        if priority == PRIORITY_USER_COMMAND:
+                            self._pending_sends[counter] = (priority, message)
+                            self._logger.debug(f"Tracking pending send: Command #{counter}")
                     else:
                         self._logger.error(f"SEND FAILED: Command #{counter} - not connected (transport={self._transport is not None}, connected={self._connected})")
                     
@@ -957,6 +979,37 @@ class MixerProtocol(asyncio.Protocol):
         # Might be <Z1.MU,M/> to mute?
         self._logger.warning("Mute control not yet implemented for DCM1")
 
+    def _clear_pending_send(self, counter: int):
+        """Clear a pending send from tracking after successful confirmation.
+        
+        Args:
+            counter: Command counter to clear from pending sends
+        """
+        if counter in self._pending_sends:
+            del self._pending_sends[counter]
+            self._logger.debug(f"Cleared pending send: Command #{counter}")
+    
+    def _clear_all_pending_sends_by_pattern(self, pattern: str):
+        """Clear pending sends matching a command pattern (e.g., volume change for zone 1).
+        
+        Used when a command is confirmed - removes matching pending sends from recovery tracking.
+        This assumes most recent matching command was the one that was confirmed.
+        
+        Args:
+            pattern: Part of the command string to match (e.g., "<Z1.MU,L" for zone 1 volume)
+        """
+        # Find and remove the most recent pending send matching this pattern
+        to_remove = []
+        for counter in sorted(self._pending_sends.keys(), reverse=True):
+            _, message = self._pending_sends[counter]
+            if pattern in message:
+                to_remove.append(counter)
+                self._logger.debug(f"Clearing confirmed pending send: Command #{counter} matching {pattern}")
+                break  # Only clear the most recent one (most likely to be the confirmed command)
+        
+        for counter in to_remove:
+            del self._pending_sends[counter]
+
     async def _confirm_volume(self, zone_id: int, expected_level: int):
         """Query volume after setting to confirm and broadcast to all listeners.
         
@@ -985,6 +1038,7 @@ class MixerProtocol(asyncio.Protocol):
         if actual_level == "mute":
             if expected_level == 62:
                 self._logger.info(f"Volume confirmation: zone {zone_id} muted successfully")
+                self._clear_all_pending_sends_by_pattern(f"<Z{zone_id}.MU,L")
                 return
             # Retry once if we expected a number but read mute (device can lag)
             self._logger.debug(
@@ -995,6 +1049,7 @@ class MixerProtocol(asyncio.Protocol):
             retry_level = self.get_volume_level(zone_id)
             if retry_level == expected_level:
                 self._logger.info(f"Volume confirmation: zone {zone_id} set to {retry_level} after retry")
+                self._clear_all_pending_sends_by_pattern(f"<Z{zone_id}.MU,L")
             else:
                 self._logger.warning(
                     f"Volume mismatch: zone {zone_id} set to {expected_level}, got {retry_level if retry_level is not None else 'no response'}"
@@ -1012,12 +1067,14 @@ class MixerProtocol(asyncio.Protocol):
             retry_level = self.get_volume_level(zone_id)
             if retry_level == expected_level:
                 self._logger.info(f"Volume confirmation: zone {zone_id} set to {retry_level} after retry")
+                self._clear_all_pending_sends_by_pattern(f"<Z{zone_id}.MU,L")
             else:
                 self._logger.warning(
                     f"Volume mismatch: zone {zone_id} set to {expected_level}, got {retry_level if retry_level is not None else actual_level}"
                 )
         else:
             self._logger.info(f"Volume confirmation: zone {zone_id} set to {actual_level} successfully")
+            self._clear_all_pending_sends_by_pattern(f"<Z{zone_id}.MU,L")
 
     async def _confirm_source(self, zone_id: int, expected_source: int):
         """Query source after setting to confirm and broadcast to all listeners.
@@ -1045,6 +1102,7 @@ class MixerProtocol(asyncio.Protocol):
             self._logger.warning(f"Source mismatch: zone {zone_id} set to {expected_source}, got {actual_source}")
         else:
             self._logger.info(f"Source confirmation: zone {zone_id} set to source {actual_source} successfully")
+            self._clear_all_pending_sends_by_pattern(f"<Z{zone_id}.MU,S")
 
     async def _confirm_group_volume(self, group_id: int, expected_level: int):
         """Query group volume after setting to confirm and broadcast to all listeners.
@@ -1074,6 +1132,7 @@ class MixerProtocol(asyncio.Protocol):
         if actual_level == "mute":
             if expected_level == 62:
                 self._logger.info(f"Volume confirmation: group {group_id} muted successfully")
+                self._clear_all_pending_sends_by_pattern(f"<G{group_id}.MU,L")
                 return
             # Retry once if we expected a number but read mute (device can lag)
             self._logger.debug(
@@ -1084,6 +1143,7 @@ class MixerProtocol(asyncio.Protocol):
             retry_level = self.get_group_volume_level(group_id)
             if retry_level == expected_level:
                 self._logger.info(f"Volume confirmation: group {group_id} set to {retry_level} after retry")
+                self._clear_all_pending_sends_by_pattern(f"<G{group_id}.MU,L")
             else:
                 self._logger.warning(
                     f"Volume mismatch: group {group_id} set to {expected_level}, got {retry_level if retry_level is not None else 'no response'}"
@@ -1101,12 +1161,14 @@ class MixerProtocol(asyncio.Protocol):
             retry_level = self.get_group_volume_level(group_id)
             if retry_level == expected_level:
                 self._logger.info(f"Volume confirmation: group {group_id} set to {retry_level} after retry")
+                self._clear_all_pending_sends_by_pattern(f"<G{group_id}.MU,L")
             else:
                 self._logger.warning(
                     f"Volume mismatch: group {group_id} set to {expected_level}, got {retry_level if retry_level is not None else actual_level}"
                 )
         else:
             self._logger.info(f"Volume confirmation: group {group_id} set to {actual_level} successfully")
+            self._clear_all_pending_sends_by_pattern(f"<G{group_id}.MU,L")
 
     async def _confirm_group_source(self, group_id: int, expected_source: int):
         """Query group source after setting to confirm and broadcast to all listeners.
@@ -1134,3 +1196,4 @@ class MixerProtocol(asyncio.Protocol):
             self._logger.warning(f"Source mismatch: group {group_id} set to {expected_source}, got {actual_source}")
         else:
             self._logger.info(f"Source confirmation: group {group_id} set to source {actual_source} successfully")
+            self._clear_all_pending_sends_by_pattern(f"<G{group_id}.MU,S")
