@@ -114,6 +114,13 @@ class MixerProtocol(asyncio.Protocol):
         # Track confirmation tasks to cancel them when new requests arrive
         self._zone_volume_confirm_task: dict[int, Task[Any]] = {}
         self._group_volume_confirm_task: dict[int, Task[Any]] = {}
+        # Source command debouncing: maps zone_id -> (pending_source_id, debounce_task)
+        self._zone_source_debounce: dict[int, tuple[int, Task[Any]]] = {}
+        # Group source debouncing: maps group_id -> (pending_source_id, debounce_task)
+        self._group_source_debounce: dict[int, tuple[int, Task[Any]]] = {}
+        # Track source confirmation tasks to cancel them when new requests arrive
+        self._zone_source_confirm_task: dict[int, Task[Any]] = {}
+        self._group_source_confirm_task: dict[int, Task[Any]] = {}
 
     async def async_connect(self):
         transport, protocol = await self._loop.create_connection(
@@ -467,12 +474,18 @@ class MixerProtocol(asyncio.Protocol):
         self._source_change_callback.source_changed(zone_id_int, source_id_int)
 
     def send_change_source(self, source_id: int, zone_id: int):
+        """Set source for a zone with debounce to prevent command collisions.
+        
+        Rapid consecutive source changes are coalesced: only the final command is sent.
+        
+        Args:
+            zone_id: Zone ID (1-8)
+            source_id: Source ID (1-8)
+        """
         self._logger.info(
-            f"Sending Zone source change message - Zone: {zone_id} changed to source: {source_id}"
+            f"Source request - Zone: {zone_id} to source: {source_id} (debounced)"
         )
-        # DCM1 uses <ZX.MU,SN/> to set zone X to source N
-        # Example: <Z4.MU,S1/> sets zone 4 to source 1
-        # Response: <z4.mu,s=1/>
+        # Validate inputs early
         if not (1 <= source_id <= self._source_count):
             self._logger.error(f"Invalid source_id {source_id}, must be 1-{self._source_count}")
             return
@@ -480,14 +493,25 @@ class MixerProtocol(asyncio.Protocol):
             self._logger.error(f"Invalid zone_id {zone_id}, must be 1-{self._zone_count}")
             return
         
-        # Set the source on this zone - use persistent connection for commands
-        command = f"<Z{zone_id}.MU,S{source_id}/>\r"
-        self._logger.info(f"Queueing command: {command.encode()}")
-        self._data_send_persistent(command)
+        # Cancel any pending debounce timer for this zone
+        if zone_id in self._zone_source_debounce:
+            old_source, old_task = self._zone_source_debounce[zone_id]
+            if old_task and not old_task.done():
+                old_task.cancel()
+                self._logger.debug(f"Cancelled pending source command for zone {zone_id} (was set to {old_source})")
         
-        # Auto-confirm if enabled
-        if self._command_confirmation:
-            self._loop.create_task(self._confirm_source(zone_id, source_id))
+        # Cancel any pending confirmation task for this zone (prevents race conditions)
+        if zone_id in self._zone_source_confirm_task:
+            old_confirm_task = self._zone_source_confirm_task[zone_id]
+            if old_confirm_task and not old_confirm_task.done():
+                old_confirm_task.cancel()
+                self._logger.debug(f"Cancelled pending source confirmation for zone {zone_id}")
+        
+        # Create a new debounce task that will send the command after a delay
+        debounce_task = self._loop.create_task(
+            self._debounce_source_command(zone_id, source_id)
+        )
+        self._zone_source_debounce[zone_id] = (source_id, debounce_task)
 
     def send_volume_level(self, zone_id: int, level):
         """Set volume level for a zone with debounce to prevent command collisions.
@@ -622,18 +646,18 @@ class MixerProtocol(asyncio.Protocol):
                 del self._group_volume_debounce[group_id]
 
     def send_group_source(self, source_id: int, group_id: int):
-        """Set a group to use a specific source.
+        """Set a group to use a specific source with debounce to prevent command collisions.
+        
+        Rapid consecutive source changes are coalesced: only the final command is sent.
         
         Args:
             source_id: Source ID (1-8)
             group_id: Group ID (1-4)
         """
         self._logger.info(
-            f"Sending Group source change message - Group: {group_id} changed to source: {source_id}"
+            f"Source request - Group: {group_id} to source: {source_id} (debounced)"
         )
-        # DCM1 uses <GX.MU,SN/> to set group X to source N
-        # Example: <G1.MU,S7/> sets group 1 to source 7
-        # Response: <g1.mu,s=7/>
+        # Validate inputs early
         if not (1 <= source_id <= self._source_count):
             self._logger.error(f"Invalid source_id {source_id}, must be 1-{self._source_count}")
             return
@@ -641,9 +665,25 @@ class MixerProtocol(asyncio.Protocol):
             self._logger.error(f"Invalid group_id {group_id}, must be 1-4")
             return
         
-        command = f"<G{group_id}.MU,S{source_id}/>\r"
-        self._logger.info(f"Queueing command: {command.encode()}")
-        self._data_send_persistent(command)
+        # Cancel any pending debounce timer for this group
+        if group_id in self._group_source_debounce:
+            old_source, old_task = self._group_source_debounce[group_id]
+            if old_task and not old_task.done():
+                old_task.cancel()
+                self._logger.debug(f"Cancelled pending source command for group {group_id} (was set to {old_source})")
+        
+        # Cancel any pending confirmation task for this group (prevents race conditions)
+        if group_id in self._group_source_confirm_task:
+            old_confirm_task = self._group_source_confirm_task[group_id]
+            if old_confirm_task and not old_confirm_task.done():
+                old_confirm_task.cancel()
+                self._logger.debug(f"Cancelled pending source confirmation for group {group_id}")
+        
+        # Create a new debounce task that will send the command after a delay
+        debounce_task = self._loop.create_task(
+            self._debounce_group_source_command(group_id, source_id)
+        )
+        self._group_source_debounce[group_id] = (source_id, debounce_task)
 
     def send_group_volume_level(self, group_id: int, level):
         """Set volume level for a group with debounce to prevent command collisions.
@@ -698,6 +738,82 @@ class MixerProtocol(asyncio.Protocol):
             self._debounce_group_volume_command(group_id, level_str, expected_level)
         )
         self._group_volume_debounce[group_id] = (level, debounce_task)
+
+    async def _debounce_source_command(self, zone_id: int, source_id: int):
+        """Wait for debounce delay, then send source command if not superseded.
+        
+        Args:
+            zone_id: Zone ID (1-8)
+            source_id: Source ID (1-8)
+        """
+        try:
+            # Wait for debounce window to pass (no more rapid requests)
+            await asyncio.sleep(self._volume_debounce_delay)
+            
+            # Check if this task was cancelled (superseded by newer request)
+            if zone_id in self._zone_source_debounce:
+                _, current_task = self._zone_source_debounce[zone_id]
+                if current_task != asyncio.current_task():
+                    # This task was superseded; don't send
+                    self._logger.debug(f"Source command for zone {zone_id} to source {source_id} was superseded")
+                    return
+            
+            # Send the actual command
+            command = f"<Z{zone_id}.MU,S{source_id}/>\r"
+            self._logger.info(f"Queueing debounced source command: {command.encode()}")
+            self._data_send_persistent(command)
+            
+            # Auto-confirm if enabled - track the task so it can be cancelled if needed
+            if self._command_confirmation:
+                confirm_task = self._loop.create_task(self._confirm_source(zone_id, source_id))
+                self._zone_source_confirm_task[zone_id] = confirm_task
+            
+            # Clean up debounce tracker
+            if zone_id in self._zone_source_debounce:
+                del self._zone_source_debounce[zone_id]
+        except asyncio.CancelledError:
+            # Task was cancelled; another request superseded it
+            self._logger.debug(f"Debounce task for zone {zone_id} source change was cancelled")
+            if zone_id in self._zone_source_debounce:
+                del self._zone_source_debounce[zone_id]
+
+    async def _debounce_group_source_command(self, group_id: int, source_id: int):
+        """Wait for debounce delay, then send group source command if not superseded.
+        
+        Args:
+            group_id: Group ID (1-4)
+            source_id: Source ID (1-8)
+        """
+        try:
+            # Wait for debounce window to pass (no more rapid requests)
+            await asyncio.sleep(self._volume_debounce_delay)
+            
+            # Check if this task was cancelled (superseded by newer request)
+            if group_id in self._group_source_debounce:
+                _, current_task = self._group_source_debounce[group_id]
+                if current_task != asyncio.current_task():
+                    # This task was superseded; don't send
+                    self._logger.debug(f"Source command for group {group_id} to source {source_id} was superseded")
+                    return
+            
+            # Send the actual command
+            command = f"<G{group_id}.MU,S{source_id}/>\r"
+            self._logger.info(f"Queueing debounced source command: {command.encode()}")
+            self._data_send_persistent(command)
+            
+            # Auto-confirm if enabled - track the task so it can be cancelled if needed
+            if self._command_confirmation:
+                confirm_task = self._loop.create_task(self._confirm_group_source(group_id, source_id))
+                self._group_source_confirm_task[group_id] = confirm_task
+            
+            # Clean up debounce tracker
+            if group_id in self._group_source_debounce:
+                del self._group_source_debounce[group_id]
+        except asyncio.CancelledError:
+            # Task was cancelled; another request superseded it
+            self._logger.debug(f"Debounce task for group {group_id} source change was cancelled")
+            if group_id in self._group_source_debounce:
+                del self._group_source_debounce[group_id]
 
     def send_zone_source_query_messages(self):
         self._logger.info(f"Sending status query messages for all zones")
@@ -991,3 +1107,30 @@ class MixerProtocol(asyncio.Protocol):
                 )
         else:
             self._logger.info(f"Volume confirmation: group {group_id} set to {actual_level} successfully")
+
+    async def _confirm_group_source(self, group_id: int, expected_source: int):
+        """Query group source after setting to confirm and broadcast to all listeners.
+        
+        Args:
+            group_id: Group ID (1-4)
+            expected_source: Expected source ID (1-8)
+        """
+        # Wait for SET command to be sent and processed by DCM1
+        # Min delay between sends is 0.1s, plus DCM1 processing time
+        await asyncio.sleep(0.3)
+        self._logger.debug(f"Confirming source for group {group_id}, expected: {expected_source}")
+        
+        # Query the source - this will broadcast the response to all listeners
+        self._data_send_persistent(f"<G{group_id}.MU,SQ/>\r")
+        
+        # Wait for QUERY to be sent (0.1s min delay) + network + DCM1 response + processing
+        await asyncio.sleep(0.5)
+        
+        # Check if the source matches expected
+        actual_source = self.get_group_source(group_id)
+        if actual_source is None:
+            self._logger.warning(f"Source confirmation: no response received for group {group_id}")
+        elif actual_source != expected_source:
+            self._logger.warning(f"Source mismatch: group {group_id} set to {expected_source}, got {actual_source}")
+        else:
+            self._logger.info(f"Source confirmation: group {group_id} set to source {actual_source} successfully")
