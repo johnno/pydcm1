@@ -563,6 +563,14 @@ class MixerProtocol(asyncio.Protocol):
             level_str = volume_level_match.group(2)
             # Remove from pending heartbeat queries when response received
             self._pending_heartbeat_queries.discard(f"<Z{zone_id}.MU,LQ/>\r")
+            # Ignore heartbeat/old responses while a volume command is still debouncing
+            # This prevents stale reads from clobbering pending UI changes before we send
+            if zone_id in self._zone_volume_debounce:
+                self._logger.debug(
+                    "Ignoring volume response for zone %s while command is debounced",
+                    zone_id,
+                )
+                return
             # Parse level - can be numeric or "mute"
             if level_str.lower() == "mute":
                 level = "mute"
@@ -671,6 +679,13 @@ class MixerProtocol(asyncio.Protocol):
             level_str = match.group(2)
             # Remove from pending heartbeat queries when response received
             self._pending_heartbeat_queries.discard(f"<G{group_id}.MU,LQ/>\r")
+            # Ignore heartbeat/old responses while a volume command is still debouncing
+            if group_id in self._group_volume_debounce:
+                self._logger.debug(
+                    "Ignoring group volume response for group %s while command is debounced",
+                    group_id,
+                )
+                return
             
             if level_str.lower() == "mute":
                 level = "mute"
