@@ -282,6 +282,14 @@ class MixerProtocol(asyncio.Protocol):
                 # Priority queue returns (priority, counter, (message, response_validator))
                 priority, counter, (message, response_validator) = await self._command_queue.get()
                 try:
+                    # Track write commands for recovery on reconnection BEFORE sending
+                    # This ensures commands are tracked even if send fails due to disconnection
+                    if priority == PRIORITY_WRITE:
+                        self._inflight_sends[counter] = (priority, message)
+                        self._logger.debug(f"Tracking inflight send: Command #{counter}")
+                        # Remove any older inflight commands for the same zone/group to avoid resending superseded commands
+                        self._debounce_inflight_sends(counter, message)
+                    
                     # Enforce minimum delay between commands to avoid MCU serial port clashes
                     time_since_last_send = time.time() - self._last_send_time
                     if time_since_last_send < self._min_send_delay:
@@ -293,14 +301,6 @@ class MixerProtocol(asyncio.Protocol):
                         self._logger.info(f"SEND: Command #{counter} (priority={priority}): {message.encode()}")
                         self._transport.write(message.encode())
                         self._logger.info(f"SEND: Command #{counter} written to transport successfully")
-                        
-                        # Track write commands for recovery on reconnection
-                        # Read queries (priority 20) don't need tracking - they're regenerated
-                        if priority == PRIORITY_WRITE:
-                            self._inflight_sends[counter] = (priority, message)
-                            self._logger.debug(f"Tracking inflight send: Command #{counter}")
-                            # Remove any older inflight commands for the same zone/group to avoid resending superseded commands
-                            self._debounce_inflight_sends(counter, message)
                     else:
                         self._logger.error(f"SEND FAILED: Command #{counter} - not connected (transport={self._transport is not None}, connected={self._connected})")
                         # Connection is definitely down - trigger immediate reconnection
