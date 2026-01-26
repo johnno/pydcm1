@@ -286,7 +286,7 @@ class MixerProtocol(asyncio.Protocol):
                     # This ensures commands are tracked even if send fails due to disconnection
                     if priority == PRIORITY_WRITE:
                         self._inflight_sends[counter] = (priority, message)
-                        self._logger.debug(f"Tracking inflight send: Command #{counter}")
+                        self._logger.info(f"Tracking inflight send: Command #{counter}")
                         # Remove any older inflight commands for the same zone/group to avoid resending superseded commands
                         self._debounce_inflight_sends(counter, message)
                     
