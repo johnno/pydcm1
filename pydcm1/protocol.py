@@ -144,6 +144,12 @@ class MixerProtocol(asyncio.Protocol):
         # Retry inflight commands on confirmation failures due to shared serial line interference
         self._retry_on_confirmation_timeout: bool = True  # Retry if no response from device
         self._retry_on_confirmation_mismatch: bool = True  # TODO: Retry if response has wrong value
+        # Track retry attempts per command. Retry quota is PER-CONNECTION:
+        # - While connected: limited to _max_retries to prevent infinite loops on device misbehavior
+        # - On reconnection: quota is reset (fresh connection, potentially different device state)
+        # This design treats timeout/mismatch during a connection as evidence of device issues,
+        # but connection failure itself as transport-level (not device-level), so reconnection
+        # gets a fresh quota. A command that failed once then reconnected is fair to retry fully again.
         self._inflight_retry_count: dict[int, int] = {}  # Track retry attempts per command
         self._max_retries: int = 1  # Max retry attempts per command
 
@@ -240,7 +246,11 @@ class MixerProtocol(asyncio.Protocol):
         # Re-queue any inflight user commands that were sent but not confirmed before disconnect
         if should_queue_inflight and self._inflight_sends:
             self._logger.warning(f"Re-queueing {len(self._inflight_sends)} inflight user commands after reconnection")
-            # Clear retry counts for fresh attempt after reconnection (transport-driven requeue is unlimited)
+            # Clear retry counts for fresh quota on new connection. Rationale: if a command timed out
+            # before disconnect, that timeout may have been due to the bad connection about to fail,
+            # not device misbehavior. The reconnection represents a fresh transport with potentially
+            # different device state, so it's fair to grant full retry quota. Commands that failed
+            # once on connection A and reconnected to connection B are treated fresh.
             self._inflight_retry_count.clear()
             # Sort by counter to maintain FIFO order within inflight sends
             for counter in sorted(self._inflight_sends.keys()):
