@@ -244,6 +244,8 @@ class MixerProtocol(asyncio.Protocol):
             for counter in sorted(self._inflight_sends.keys()):
                 priority, message = self._inflight_sends[counter]
                 self._logger.info(f"Re-queueing pending command #{counter}: {message.strip()}")
+                # Reset retry count for fresh attempt after reconnection (transport-driven requeue is unlimited)
+                self._inflight_retry_count[counter] = 0
                 try:
                     self._command_queue.put_nowait((priority, counter, (message, None)))
                 except asyncio.QueueFull:
@@ -419,6 +421,19 @@ class MixerProtocol(asyncio.Protocol):
             self._heartbeat_task.cancel()
         if self._command_worker_task is not None:
             self._command_worker_task.cancel()
+        # Cancel confirmation tasks so they don't burn retry budget while offline
+        for task in self._zone_volume_confirm_task.values():
+            if task and not task.done():
+                task.cancel()
+        for task in self._group_volume_confirm_task.values():
+            if task and not task.done():
+                task.cancel()
+        for task in self._zone_source_confirm_task.values():
+            if task and not task.done():
+                task.cancel()
+        for task in self._group_source_confirm_task.values():
+            if task and not task.done():
+                task.cancel()
         if hasattr(self, '_connection_watchdog_task') and self._connection_watchdog_task is not None:
             self._connection_watchdog_task.cancel()
         disconnected_message = f"Disconnected from {self._hostname}"
@@ -1187,6 +1202,10 @@ class MixerProtocol(asyncio.Protocol):
         """
         if counter not in self._inflight_sends:
             self._logger.warning(f"Cannot retry: command #{counter} not in inflight_sends")
+            return False
+        # If we're offline, don't consume retry budget; reconnection logic will requeue
+        if not self._connected or self._transport is None:
+            self._logger.debug(f"Skip retry for command #{counter}: transport unavailable (offline)")
             return False
         
         retry_count = self._inflight_retry_count.get(counter, 0)
