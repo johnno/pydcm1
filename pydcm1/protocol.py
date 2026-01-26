@@ -984,28 +984,28 @@ class MixerProtocol(asyncio.Protocol):
         # Response: <zX.mu,s=N/> where N is the source ID (0 = no source)
         for zone_id in range(1, self._zone_count + 1):
             # Use persistent connection for queries
-            self._data_send_persistent(f"<Z{zone_id}.MU,SQ/>\r")
+            self._data_send_persistent(f"<Z{zone_id}.MU,SQ/>\r", PRIORITY_HEARTBEAT)
 
     def send_zone_label_query_messages(self):
         self._logger.info(f"Querying zone labels")
         # DCM1 uses <ZX,LQ/> to query the label/name of zone X
         # Response: <zX,lq[label]/> where [label] is the zone name
         for zone_id in range(1, self._zone_count + 1):
-            self._data_send_persistent(f"<Z{zone_id},LQ/>\r")
+            self._data_send_persistent(f"<Z{zone_id},LQ/>\r", PRIORITY_HEARTBEAT)
 
     def send_source_label_query_messages(self):
         self._logger.info(f"Querying source labels")
         # DCM1 uses <LX,LQ/> to query the label/name of line source X
         # Response: <lX,lq[label]/> where [label] is the source name
         for source_id in range(1, self._source_count + 1):
-            self._data_send_persistent(f"<L{source_id},LQ/>\r")
+            self._data_send_persistent(f"<L{source_id},LQ/>\r", PRIORITY_HEARTBEAT)
 
     def send_volume_level_query_messages(self):
         self._logger.info(f"Querying zone volume levels")
         # DCM1 uses <ZX.MU,LQ/> to query the volume level of zone X
         # Response: <zX.mu,l=N/> where N is the level (0-61) or "mute"
         for zone_id in range(1, self._zone_count + 1):
-            self._data_send_persistent(f"<Z{zone_id}.MU,LQ/>\r")
+            self._data_send_persistent(f"<Z{zone_id}.MU,LQ/>\r", PRIORITY_HEARTBEAT)
 
     def send_line_input_enable_query_messages(self, zone_id: int):
         """Query which line inputs are enabled for a specific zone.
@@ -1017,7 +1017,7 @@ class MixerProtocol(asyncio.Protocol):
         # DCM1 uses <ZX.LY,Q/> to query if line input Y is enabled for zone X
         # Response: <zX.lY,q=e, pri = off/> where q=e means enabled, q=d means disabled
         for line_id in range(1, self._source_count + 1):
-            self._data_send_persistent(f"<Z{zone_id}.L{line_id},Q/>\r")
+            self._data_send_persistent(f"<Z{zone_id}.L{line_id},Q/>\r", PRIORITY_HEARTBEAT)
 
     def send_group_line_input_enable_query_messages(self, group_id: int):
         """Query which line inputs are enabled for a specific group.
@@ -1033,7 +1033,7 @@ class MixerProtocol(asyncio.Protocol):
     def send_group_volume_query_messages(self, group_id: int):
         """Send queries for a group's volume level."""
         self._logger.info(f"Querying volume level for group {group_id}")
-        self._data_send_persistent(f"<G{group_id}.MU,LQ/>\r")
+        self._data_send_persistent(f"<G{group_id}.MU,LQ/>\r", PRIORITY_HEARTBEAT)
     def send_all_group_queries(self):
         """Query labels, status, volume, source, and line inputs for all 4 groups.
         
@@ -1247,7 +1247,7 @@ class MixerProtocol(asyncio.Protocol):
         self._logger.debug(f"Confirming volume for zone {zone_id}, expected: {expected_level}")
         
         # Query the volume level - this will broadcast the response to all listeners
-        self._data_send_persistent(f"<Z{zone_id}.MU,LQ/>\r")
+        self._data_send_persistent(f"<Z{zone_id}.MU,LQ/>\r", PRIORITY_HEARTBEAT)
         
         # Wait for QUERY to be sent (0.1s min delay) + network + DCM1 response + processing
         await asyncio.sleep(0.5)
@@ -1280,7 +1280,7 @@ class MixerProtocol(asyncio.Protocol):
             self._logger.debug(
                 f"Volume mismatch (got mute), retrying query once: zone {zone_id} expected {expected_level}"
             )
-            self._data_send_persistent(f"<Z{zone_id}.MU,LQ/>\r")
+            self._data_send_persistent(f"<Z{zone_id}.MU,LQ/>\r", PRIORITY_HEARTBEAT)
             await asyncio.sleep(0.4)
             retry_level = self.get_volume_level(zone_id)
             if retry_level == expected_level:
@@ -1300,7 +1300,7 @@ class MixerProtocol(asyncio.Protocol):
             self._logger.debug(
                 f"Volume mismatch (first read {actual_level}), retrying query once: zone {zone_id} expected {expected_level}"
             )
-            self._data_send_persistent(f"<Z{zone_id}.MU,LQ/>\r")
+            self._data_send_persistent(f"<Z{zone_id}.MU,LQ/>\r", PRIORITY_HEARTBEAT)
             await asyncio.sleep(0.4)
             retry_level = self.get_volume_level(zone_id)
             if retry_level == expected_level:
@@ -1329,7 +1329,7 @@ class MixerProtocol(asyncio.Protocol):
         self._logger.debug(f"Confirming source for zone {zone_id}, expected: {expected_source}")
         
         # Query the source - this will broadcast the response to all listeners
-        self._data_send_persistent(f"<Z{zone_id}.MU,SQ/>\r")
+        self._data_send_persistent(f"<Z{zone_id}.MU,SQ/>\r", PRIORITY_HEARTBEAT)
         
         # Wait for QUERY to be sent (0.1s min delay) + network + DCM1 response + processing
         await asyncio.sleep(0.5)
@@ -1370,7 +1370,7 @@ class MixerProtocol(asyncio.Protocol):
         self._logger.debug(f"Confirming volume for group {group_id}, expected: {expected_level}")
         
         # Query the volume level - this will broadcast the response to all listeners
-        self._data_send_persistent(f"<G{group_id}.MU,LQ/>\r")
+        self._data_send_persistent(f"<G{group_id}.MU,LQ/>\r", PRIORITY_HEARTBEAT)
         
         # Wait for QUERY to be sent (0.1s min delay) + network + DCM1 response + processing
         await asyncio.sleep(0.5)
@@ -1402,7 +1402,7 @@ class MixerProtocol(asyncio.Protocol):
             self._logger.debug(
                 f"Volume mismatch (got mute), retrying query once: group {group_id} expected {expected_level}"
             )
-            self._data_send_persistent(f"<G{group_id}.MU,LQ/>\r")
+            self._data_send_persistent(f"<G{group_id}.MU,LQ/>\r", PRIORITY_HEARTBEAT)
             await asyncio.sleep(0.4)
             retry_level = self.get_group_volume_level(group_id)
             if retry_level == expected_level:
@@ -1422,7 +1422,7 @@ class MixerProtocol(asyncio.Protocol):
             self._logger.debug(
                 f"Volume mismatch (first read {actual_level}), retrying query once: group {group_id} expected {expected_level}"
             )
-            self._data_send_persistent(f"<G{group_id}.MU,LQ/>\r")
+            self._data_send_persistent(f"<G{group_id}.MU,LQ/>\r", PRIORITY_HEARTBEAT)
             await asyncio.sleep(0.4)
             retry_level = self.get_group_volume_level(group_id)
             if retry_level == expected_level:
@@ -1451,7 +1451,7 @@ class MixerProtocol(asyncio.Protocol):
         self._logger.debug(f"Confirming source for group {group_id}, expected: {expected_source}")
         
         # Query the source - this will broadcast the response to all listeners
-        self._data_send_persistent(f"<G{group_id}.MU,SQ/>\r")
+        self._data_send_persistent(f"<G{group_id}.MU,SQ/>\r", PRIORITY_HEARTBEAT)
         
         # Wait for QUERY to be sent (0.1s min delay) + network + DCM1 response + processing
         await asyncio.sleep(0.5)
