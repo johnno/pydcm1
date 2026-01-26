@@ -311,12 +311,15 @@ class MixerProtocol(asyncio.Protocol):
                     
                     self._last_send_time = time.time()
                 except Exception as e:
-                    self._logger.error(f"Error sending command: {e}")
+                    self._logger.error(f"Error sending command: {e}", exc_info=True)
                 finally:
                     self._command_queue.task_done()
             except asyncio.CancelledError:
                 self._logger.debug("Command worker cancelled")
                 break
+            except Exception as e:
+                self._logger.error(f"Unexpected error in command worker loop: {e}", exc_info=True)
+                break  # Exit worker on unexpected error
 
     async def _heartbeat(self):
         """Periodically query zone and group status (volume and source) to sync with physical panel changes.
