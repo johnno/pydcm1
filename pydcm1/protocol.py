@@ -240,12 +240,12 @@ class MixerProtocol(asyncio.Protocol):
         # Re-queue any inflight user commands that were sent but not confirmed before disconnect
         if should_queue_inflight and self._inflight_sends:
             self._logger.warning(f"Re-queueing {len(self._inflight_sends)} inflight user commands after reconnection")
+            # Clear retry counts for fresh attempt after reconnection (transport-driven requeue is unlimited)
+            self._inflight_retry_count.clear()
             # Sort by counter to maintain FIFO order within inflight sends
             for counter in sorted(self._inflight_sends.keys()):
                 priority, message = self._inflight_sends[counter]
                 self._logger.info(f"Re-queueing pending command #{counter}: {message.strip()}")
-                # Reset retry count for fresh attempt after reconnection (transport-driven requeue is unlimited)
-                self._inflight_retry_count[counter] = 0
                 try:
                     self._command_queue.put_nowait((priority, counter, (message, None)))
                 except asyncio.QueueFull:
