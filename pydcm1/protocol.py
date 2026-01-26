@@ -98,6 +98,9 @@ class MixerProtocol(asyncio.Protocol):
         self._group_to_source_map = {}  # Maps group_id to source_id
         self._group_line_inputs_map = {}  # Maps group_id to dict of line_id: enabled_bool
         self._group_volume_map = {}  # Maps group_id to volume level (int or "mute")
+        # Track pending heartbeat queries to prevent duplicate polling
+        # Maps query command string -> True if already queued, prevents redundant reads
+        self._pending_heartbeat_queries = set()
         # DCM1 has 8 zones and 8 line sources (hardcoded)
         self._zone_count: int = 8
         self._source_count: int = 8
@@ -230,6 +233,9 @@ class MixerProtocol(asyncio.Protocol):
                 
                 should_queue_inflight = False
             self._connection_lost_time = None
+            
+            # Clear pending heartbeat queries since the device won't respond to stale requests
+            self._pending_heartbeat_queries.clear()
         
         # Re-queue any inflight user commands that were sent but not confirmed before disconnect
         if should_queue_inflight and self._inflight_sends:
@@ -300,7 +306,12 @@ class MixerProtocol(asyncio.Protocol):
                 break
 
     async def _heartbeat(self):
-        """Periodically query zone and group status (volume and source) to sync with physical panel changes."""
+        """Periodically query zone and group status (volume and source) to sync with physical panel changes.
+        
+        Deduplicates queries: if a query is already pending in the queue, skip it to avoid
+        redundant polling. Since protocol responses are unsolicited status messages, one 
+        query answers all waiting consumers—there's no temporal significance to duplicate queries.
+        """
         while True:
             await asyncio.sleep(self._heartbeat_time)
             
@@ -310,22 +321,36 @@ class MixerProtocol(asyncio.Protocol):
             # This keeps HA in sync when staff use physical volume knobs or buttons
             # Use low priority so user commands can jump ahead
             for zone_id in range(1, self._zone_count + 1):
-                # Query volume level with low priority
-                self._command_counter += 1
-                await self._command_queue.put((PRIORITY_READ, self._command_counter, (f"<Z{zone_id}.MU,LQ/>\r", None)))
-                # Query source with low priority
-                self._command_counter += 1
-                await self._command_queue.put((PRIORITY_READ, self._command_counter, (f"<Z{zone_id}.MU,SQ/>\r", None)))
+                # Query volume level with deduplication
+                volume_query = f"<Z{zone_id}.MU,LQ/>\r"
+                if volume_query not in self._pending_heartbeat_queries:
+                    self._command_counter += 1
+                    self._pending_heartbeat_queries.add(volume_query)
+                    await self._command_queue.put((PRIORITY_READ, self._command_counter, (volume_query, None)))
+                
+                # Query source with deduplication
+                source_query = f"<Z{zone_id}.MU,SQ/>\r"
+                if source_query not in self._pending_heartbeat_queries:
+                    self._command_counter += 1
+                    self._pending_heartbeat_queries.add(source_query)
+                    await self._command_queue.put((PRIORITY_READ, self._command_counter, (source_query, None)))
             
             # Query volume and source for all groups (4 groups on DCM1)
             # This keeps groups in sync with physical panel changes
             for group_id in range(1, 5):
-                # Query group volume level with low priority
-                self._command_counter += 1
-                await self._command_queue.put((PRIORITY_READ, self._command_counter, (f"<G{group_id}.MU,LQ/>\r", None)))
-                # Query group source with low priority
-                self._command_counter += 1
-                await self._command_queue.put((PRIORITY_READ, self._command_counter, (f"<G{group_id}.MU,SQ/>\r", None)))
+                # Query group volume level with deduplication
+                group_volume_query = f"<G{group_id}.MU,LQ/>\r"
+                if group_volume_query not in self._pending_heartbeat_queries:
+                    self._command_counter += 1
+                    self._pending_heartbeat_queries.add(group_volume_query)
+                    await self._command_queue.put((PRIORITY_READ, self._command_counter, (group_volume_query, None)))
+                
+                # Query group source with deduplication
+                group_source_query = f"<G{group_id}.MU,SQ/>\r"
+                if group_source_query not in self._pending_heartbeat_queries:
+                    self._command_counter += 1
+                    self._pending_heartbeat_queries.add(group_source_query)
+                    await self._command_queue.put((PRIORITY_READ, self._command_counter, (group_source_query, None)))
 
     async def _connection_watchdog(self):
         """Monitor connection health and trigger reconnection if connection dies silently.
@@ -474,6 +499,8 @@ class MixerProtocol(asyncio.Protocol):
             self._logger.info(f"RECV: Zone source response: {message}")
             zone_id = int(zone_source_match.group(1))
             source_id = int(zone_source_match.group(2))
+            # Remove from pending heartbeat queries when response received
+            self._pending_heartbeat_queries.discard(f"<Z{zone_id}.MU,SQ/>\r")
             # Source ID 0 means no source is active, don't process it
             if source_id > 0:
                 self._process_source_changed(source_id, zone_id)
@@ -505,6 +532,8 @@ class MixerProtocol(asyncio.Protocol):
             self._logger.info(f"RECV: Volume level response: {message}")
             zone_id = int(volume_level_match.group(1))
             level_str = volume_level_match.group(2)
+            # Remove from pending heartbeat queries when response received
+            self._pending_heartbeat_queries.discard(f"<Z{zone_id}.MU,LQ/>\r")
             # Parse level - can be numeric or "mute"
             if level_str.lower() == "mute":
                 level = "mute"
@@ -611,6 +640,8 @@ class MixerProtocol(asyncio.Protocol):
         if match:
             group_id = int(match.group(1))
             level_str = match.group(2)
+            # Remove from pending heartbeat queries when response received
+            self._pending_heartbeat_queries.discard(f"<G{group_id}.MU,LQ/>\r")
             
             if level_str.lower() == "mute":
                 level = "mute"
@@ -628,6 +659,8 @@ class MixerProtocol(asyncio.Protocol):
             self._logger.debug(f"Group source response received: {message}")
             group_id = int(group_source_match.group(1))
             source_id = int(group_source_match.group(2))
+            # Remove from pending heartbeat queries when response received
+            self._pending_heartbeat_queries.discard(f"<G{group_id}.MU,SQ/>\r")
             self._group_to_source_map[group_id] = source_id
             self._logger.info(f"Group {group_id} source: {source_id}")
             # Notify callback
