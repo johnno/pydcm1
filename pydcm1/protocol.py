@@ -450,12 +450,8 @@ class MixerProtocol(asyncio.Protocol):
                 task.cancel()
         if hasattr(self, '_connection_watchdog_task') and self._connection_watchdog_task is not None:
             self._connection_watchdog_task.cancel()
-        disconnected_message = f"Disconnected from {self._hostname}"
         if self._reconnect:
-            disconnected_message = (
-                disconnected_message
-                + " will try to reconnect in {self._reconnect_time} seconds"
-            )
+            disconnected_message = f"Disconnected from {self._hostname} will try to reconnect in {self._reconnect_time} seconds"
             self._logger.error(disconnected_message)
         else:
             disconnected_message = disconnected_message + " not reconnecting"
@@ -564,7 +560,16 @@ class MixerProtocol(asyncio.Protocol):
             # Remove from pending heartbeat queries when response received
             self._pending_heartbeat_queries.discard(f"<Z{zone_id}.MU,LQ/>\r")
             # Ignore heartbeat/old responses while a volume command is still debouncing
-            # This prevents stale reads from clobbering pending UI changes before we send
+            # This prevents sending UI state updates that are about to be superseded by the pending command.
+            # 
+            # NOTE: This does NOT fully mitigate race conditions for listeners consuming these responses
+            # as general events. After debounce completes (~0.5s) and the command is sent, debounce 
+            # tracking is cleared, creating a ~0.8s window until confirmation completes where stale
+            # heartbeat responses could still arrive and trigger UI updates. The media_player layer
+            # handles this race by storing _pending_raw_volume_level and ignoring non-matching responses.
+            # 
+            # Edge case: Physical knob changes during the pending window (~1s total) are temporarily
+            # "lost" until next heartbeat (~10s). Acceptable for single-staff operation.
             if zone_id in self._zone_volume_debounce:
                 self._logger.debug(
                     "Ignoring volume response for zone %s while command is debounced",
@@ -680,6 +685,7 @@ class MixerProtocol(asyncio.Protocol):
             # Remove from pending heartbeat queries when response received
             self._pending_heartbeat_queries.discard(f"<G{group_id}.MU,LQ/>\r")
             # Ignore heartbeat/old responses while a volume command is still debouncing
+            # (See zone volume handling above for detailed explanation of race condition window)
             if group_id in self._group_volume_debounce:
                 self._logger.debug(
                     "Ignoring group volume response for group %s while command is debounced",
