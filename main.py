@@ -15,63 +15,51 @@ async def show_status(hostname: str, port: int):
     """Query and display the status of all zones."""
     print(f"Connecting to DCM1 at {hostname}:{port}...")
     
-    mixer = DCM1Mixer(hostname, port)
+    mixer = DCM1Mixer(hostname, port, enable_heartbeat=False)
     await mixer.async_connect()
     
-    # Wait for the initial queries to complete
-    # With 32 commands (8 zone labels + 8 source labels + 8 volume levels + 8 sources) and 0.1s delay
-    print("Querying zone labels, source labels, volume levels, and status...")
-    await asyncio.sleep(5)
-    
-    # Query group information (labels, status, volume, and line inputs)
-    print("Querying group information...")
-    mixer.query_all_groups()
-    await asyncio.sleep(5)  # Wait for 44 group commands (4 groups × 11)
-    
-    # Query line input enables for all zones
-    for zone_id in range(1, 9):
-        mixer.query_line_inputs(zone_id)
-    
-    # Wait for line input queries to complete (8 zones * 8 lines * 0.1s)
-    await asyncio.sleep(7)
+    # Wait for all initial protocol queries to be sent before displaying status
+    protocol = mixer.protocol
+    print("Waiting for all protocol commands to be sent...")
+    while True:
+        if hasattr(protocol, '_command_queue') and protocol._command_queue.empty():
+            if not hasattr(protocol, '_worker_processing') or not protocol._worker_processing:
+                break
+        await asyncio.sleep(0.1)
     
     print("\nZone Status:")
     print("-" * 100)
     
-    for zone_id in range(1, 9):
-        zone = mixer.zones_by_id.get(zone_id)
-        if zone:
-            source_id = mixer.protocol.get_status_of_zone(zone_id)
-            volume = mixer.protocol.get_volume_level(zone_id)
-            enabled_inputs = mixer.get_enabled_line_inputs(zone_id)
-            
-            # Format volume display
-            if volume == "mute":
-                volume_str = "MUTE"
-            elif volume is not None:
-                # Level is directly the negative dB value (level 28 = -28dB)
-                db_value = -volume
-                volume_str = f"{db_value}dB"
-            else:
-                volume_str = "unknown"
-            
-            # Format enabled inputs
-            if enabled_inputs:
-                enabled_list = [str(line_id) for line_id, enabled in sorted(enabled_inputs.items()) if enabled]
-                inputs_str = ",".join(enabled_list) if enabled_list else "none"
-            else:
-                inputs_str = "querying..."
-            
-            if source_id:
-                source = mixer.sources_by_id.get(source_id)
-                source_name = source.name if source else f"Source {source_id}"
-                zone_label = f"Zone {zone_id} ({zone.name}):"
-                print(f"{zone_label:30s} {source_id} - {source_name:20s} | Vol: {volume_str:10s} | Inputs: {inputs_str}")
-            else:
-                zone_label = f"Zone {zone_id} ({zone.name}):"
-                print(f"{zone_label:30s} {'OFF':24s} | Vol: {volume_str:10s} | Inputs: {inputs_str}")
+    for zone_id in sorted(mixer.zones_by_id.keys()):
+        zone = mixer.zones_by_id[zone_id]
+        enabled_inputs = mixer.get_zone_enabled_line_inputs(zone_id)
+        source_id = mixer.get_zone_source(zone_id)
+        volume = mixer.protocol.get_zone_volume_level(zone_id)
+
+        # Format volume display
+        if volume == "mute":
+            volume_str = "MUTE"
+        elif volume is not None:
+            db_value = -volume
+            volume_str = f"{db_value}dB"
         else:
-            print(f"Zone {zone_id}: Not configured")
+            volume_str = "unknown"
+
+        # Format enabled inputs
+        if enabled_inputs:
+            enabled_list = [str(line_id) for line_id, enabled in sorted(enabled_inputs.items()) if enabled]
+            inputs_str = ",".join(enabled_list) if enabled_list else "none"
+        else:
+            inputs_str = "querying..."
+
+        if source_id:
+            source = mixer.sources_by_id.get(source_id)
+            source_name = source.name if source else f"Source {source_id}"
+            zone_label = f"Zone {zone_id} ({zone.name}):"
+            print(f"{zone_label:30s} {source_id} - {source_name:20s} | Vol: {volume_str:10s} | Inputs: {inputs_str}")
+        else:
+            zone_label = f"Zone {zone_id} ({zone.name}):"
+            print(f"{zone_label:30s} {'OFF':24s} | Vol: {volume_str:10s} | Inputs: {inputs_str}")
     
     print("-" * 100)
     
@@ -95,7 +83,7 @@ async def show_status(hostname: str, port: int):
             volume_str = "unknown"
         
         # Get line inputs for the group
-        enabled_inputs = mixer.protocol.get_enabled_group_line_inputs(group_id)
+        enabled_inputs = mixer.protocol.get_group_enabled_line_inputs(group_id)
         if enabled_inputs:
             enabled_list = [str(line_id) for line_id, enabled in sorted(enabled_inputs.items()) if enabled]
             inputs_str = ",".join(enabled_list) if enabled_list else "none"
@@ -110,7 +98,7 @@ async def show_status(hostname: str, port: int):
     mixer.close()
 
 
-async def set_source(hostname: str, port: int, zone_id: int, source_id: int):
+async def set_zone_source(hostname: str, port: int, zone_id: int, source_id: int):
     """Set a zone to a specific source."""
     print(f"Connecting to DCM1 at {hostname}:{port}...")
     
@@ -130,7 +118,7 @@ async def set_source(hostname: str, port: int, zone_id: int, source_id: int):
     print("Done")
 
 
-async def set_volume(hostname: str, port: int, zone_id: int, level):
+async def set_zone_volume_level(hostname: str, port: int, zone_id: int, level):
     """Set volume level for a zone."""
     print(f"Connecting to DCM1 at {hostname}:{port}...")
     
@@ -142,13 +130,13 @@ async def set_volume(hostname: str, port: int, zone_id: int, level):
     
     if level.lower() == "mute":
         print(f"Muting Zone {zone_id}...")
-        mixer.set_volume(zone_id, "mute")
+        mixer.set_zone_volume(zone_id, "mute")
     else:
         try:
             level_int = int(level)
             db_value = -level_int
             print(f"Setting Zone {zone_id} to {db_value}dB (level {level_int})...")
-            mixer.set_volume(zone_id, level_int)
+            mixer.set_zone_volume(zone_id, level_int)
         except ValueError:
             print(f"Error: Invalid level '{level}'. Use 0-61 or 'mute'")
             mixer.close()
@@ -169,17 +157,17 @@ def main():
     subparsers = parser.add_subparsers(dest="command", help="Command to execute")
     
     # Status command
-    subparsers.add_parser("status", help="Show status of all zones")
+    subparsers.add_parser("status", help="Show status of all zones and groups")
     
-    # Set source command
-    set_parser = subparsers.add_parser("set", help="Set zone to a specific source")
-    set_parser.add_argument("zone", type=int, help="Zone ID (1-8)")
-    set_parser.add_argument("source", type=int, help="Source ID (1-8)")
+    # Set zone source command
+    set_zone_source_parser = subparsers.add_parser("set_zone_source", help="Set zone to a specific source")
+    set_zone_source_parser.add_argument("zone", type=int, help="Zone ID (1-8)")
+    set_zone_source_parser.add_argument("source", type=int, help="Source ID (1-8)")
     
-    # Volume command
-    volume_parser = subparsers.add_parser("volume", help="Set volume level for a zone")
-    volume_parser.add_argument("zone", type=int, help="Zone ID (1-8)")
-    volume_parser.add_argument("level", help="Volume level (0-61 where 20=-20dB, 62=mute, or 'mute')")
+    # Set zone volume level command
+    set_zone_volume_level_parser = subparsers.add_parser("set_zone_volume_level", help="Set volume level for a zone")
+    set_zone_volume_level_parser.add_argument("zone", type=int, help="Zone ID (1-8)")
+    set_zone_volume_level_parser.add_argument("level", help="Volume level (0-61 where 20=-20dB, 62=mute, or 'mute')")
     
     args = parser.parse_args()
     
@@ -188,10 +176,10 @@ def main():
     
     if args.command == "status":
         asyncio.run(show_status(args.host, args.port))
-    elif args.command == "set":
-        asyncio.run(set_source(args.host, args.port, args.zone, args.source))
-    elif args.command == "volume":
-        asyncio.run(set_volume(args.host, args.port, args.zone, args.level))
+    elif args.command == "set_zone_source":
+        asyncio.run(set_zone_source(args.host, args.port, args.zone, args.source))
+    elif args.command == "set_zone_volume_level":
+        asyncio.run(set_zone_volume_level(args.host, args.port, args.zone, args.level))
     else:
         parser.print_help()
 
