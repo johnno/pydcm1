@@ -678,7 +678,7 @@ class DCM1Mixer:
         """Get the volume level for a group."""
         group = self.groups_by_id.get(group_id)
         return group.volume if group else None
-    
+
     def register_listener(self, listener):
         """Register external listener for mixer events."""
         self._multiplex_callback.register_listener(listener)
@@ -706,7 +706,7 @@ class DCM1Mixer:
             self.groups_by_name[group.name] = group
         
         # Create connection to device
-        transport, protocol = await self._loop.create_connection(
+        await self._loop.create_connection(
             lambda: self._protocol, host=self._hostname, port=self._port
         )
 
@@ -718,49 +718,41 @@ class DCM1Mixer:
 
     def set_zone_source(self, zone_id: int, source_id: int):
         """Set a zone to use a specific source."""
-        # Validate key (zone_id)
-        if not (1 <= zone_id <= self._zone_count):
-            self._logger.error(f"Invalid zone_id {zone_id}, must be 1-{self._zone_count}")
-            return
-        
-        zone = self.zones_by_id.get(zone_id)
+        zone = self._get_zone_for_write(zone_id)
         if zone:
             zone.set_source(source_id)  # Zone validates source_id
 
     def set_zone_volume(self, zone_id: int, level):
         """Set volume level for a zone."""
-        # Validate key (zone_id)
-        if not (1 <= zone_id <= self._zone_count):
-            self._logger.error(f"Invalid zone_id {zone_id}, must be 1-{self._zone_count}")
-            return
-        
-        zone = self.zones_by_id.get(zone_id)
+        zone = self._get_zone_for_write(zone_id)
         if zone:
             zone.set_volume(level)  # Zone validates level
 
     def set_group_source(self, group_id: int, source_id: int):
         """Set a group to use a specific source."""
-        # Validate key (group_id)
-        if not (1 <= group_id <= self._group_count):
-            self._logger.error(f"Invalid group_id {group_id}, must be 1-{self._group_count}")
-            return
-        
-        group = self.groups_by_id.get(group_id)
+        group = self._get_group_for_write(group_id)
         if group:
             group.set_source(source_id)  # Group validates source_id
 
     def set_group_volume(self, group_id: int, level):
         """Set volume level for a group."""
-        # Validate key (group_id)
-        if not (1 <= group_id <= self._group_count):
-            self._logger.error(f"Invalid group_id {group_id}, must be 1-{self._group_count}")
-            return
-        
-        group = self.groups_by_id.get(group_id)
+        group = self._get_group_for_write(group_id)
         if group:
             group.set_volume(level)  # Group validates level
 
-    # ========== Queue management ==========
+    def _get_zone_for_write(self, zone_id: int) -> Optional[Zone]:
+        """Validate zone_id and return Zone for write operations."""
+        if not (1 <= zone_id <= self._zone_count):
+            self._logger.error(f"Invalid zone_id {zone_id}, must be 1-{self._zone_count}")
+            return None
+        return self.zones_by_id.get(zone_id)
+
+    def _get_group_for_write(self, group_id: int) -> Optional[Group]:
+        """Validate group_id and return Group for write operations."""
+        if not (1 <= group_id <= self._group_count):
+            self._logger.error(f"Invalid group_id {group_id}, must be 1-{self._group_count}")
+            return None
+        return self.groups_by_id.get(group_id)    
 
     # ========== Queue management ==========
 
