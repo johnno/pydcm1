@@ -35,10 +35,27 @@ PRIORITY_READ = 20    # Read commands that query device state (all queries, conf
 
 
 class Zone:
-    """Represents a zone in the DCM1 mixer."""
+    """Represents a zone in the DCM1 mixer with state and control tracking."""
     def __init__(self, zone_id: int, name: str):
         self.id = zone_id
         self.name = name
+        
+        # State: Operational values
+        self.source: Optional[int] = None
+        self.volume: Optional[int | str] = None
+        self.line_inputs: dict[int, bool] = {}  # Maps line_id to enabled bool
+        
+        # Control: Debounce and confirmation tasks
+        self.source_debounce_task: Optional[Task[Any]] = None
+        self.volume_debounce_task: Optional[Task[Any]] = None
+        self.source_confirm_task: Optional[Task[Any]] = None
+        self.volume_confirm_task: Optional[Task[Any]] = None
+        
+        # Tracking: Which attributes have been received from device
+        self.label_received: bool = False
+        self.line_inputs_received: bool = False
+        self.source_received: bool = False
+        self.volume_received: bool = False
 
 
 class Source:
@@ -46,25 +63,40 @@ class Source:
     def __init__(self, source_id: int, name: str):
         self.id = source_id
         self.name = name
+        
+        # Tracking: Whether label has been received from device
+        self.label_received: bool = False
 
 
 class Group:
-    """Represents a group in the DCM1 mixer."""
+    """Represents a group in the DCM1 mixer with state and control tracking."""
     def __init__(self, group_id: int, name: str, enabled: bool = False, zones: list[int] = None):
         self.id = group_id
         self.name = name
         self.enabled = enabled
         self.zones = zones if zones else []
+        
+        # State: Operational values
+        self.source: Optional[int] = None
+        self.volume: Optional[int | str] = None
+        self.line_inputs: dict[int, bool] = {}  # Maps line_id to enabled bool
+        
+        # Control: Debounce and confirmation tasks
+        self.source_debounce_task: Optional[Task[Any]] = None
+        self.volume_debounce_task: Optional[Task[Any]] = None
+        self.source_confirm_task: Optional[Task[Any]] = None
+        self.volume_confirm_task: Optional[Task[Any]] = None
+        
+        # Tracking: Which attributes have been received from device
+        self.label_received: bool = False
+        self.status_received: bool = False
+        self.line_inputs_received: bool = False
+        self.source_received: bool = False
+        self.volume_received: bool = False
 
 
 class MixerListener(MixerResponseListener):
-    """Listener that tracks mixer state updates and reception timestamps.
-    
-    Note: Most state management (sources, volumes, line inputs, zone/group sources) is handled
-    directly by this mixer class. This listener primarily tracks when specific data has been received
-    (for wait_for_* timeout logic). Label updates are still applied here since zones/sources/groups
-    are high-level objects in this mixer class. This explains why many callback parameters go unused.
-    """
+    """Listener that tracks mixer state updates and reception timestamps."""
 
     def __init__(self, mixer):
         self._mixer = mixer
@@ -81,7 +113,7 @@ class MixerListener(MixerResponseListener):
             source.name = label
             self._mixer.sources_by_name[label] = source
             # Track that we received this source's label
-            self._mixer._sources_labels_received.add(source_id)
+            source.label_received = True
     
     def zone_label_received(self, zone_id: int, label: str):
         """Update the zone label when received from device."""
@@ -95,33 +127,36 @@ class MixerListener(MixerResponseListener):
             zone.name = label
             self._mixer.zones_by_name[label] = zone
             # Track that we received this zone's label
-            self._mixer._zones_labels_received.add(zone_id)
+            zone.label_received = True
 
     def zone_line_inputs_received(self, zone_id: int, line_inputs: dict[int, bool]):
         """Track when a zone's line input data is received."""
-        # Store the data
-        self._mixer._zone_line_inputs_map[zone_id] = line_inputs
-        # Protocol only calls this when all 8 line inputs are received
-        self._mixer._zones_line_inputs_received.add(zone_id)
+        zone = self._mixer.zones_by_id.get(zone_id)
+        if zone:
+            zone.line_inputs = line_inputs
+            zone.line_inputs_received = True
 
     def zone_source_received(self, zone_id: int, source_id: int):
         """Track when a zone's source is received from the device."""
-        # Store the data
-        self._mixer._zone_to_source_map[zone_id] = source_id
-        self._mixer._zones_sources_received.add(zone_id)
+        zone = self._mixer.zones_by_id.get(zone_id)
+        if zone:
+            zone.source = source_id
+            zone.source_received = True
 
     def zone_volume_level_received(self, zone_id: int, level):
         """Track when a zone's volume is received from the device."""
-        # Ignore heartbeat/old responses while a volume command is still debouncing
-        if zone_id in self._mixer._zone_volume_debounce_tasks:
-            self._mixer._logger.debug(
-                "Ignoring volume response for zone %s while command is debounced",
-                zone_id,
-            )
-            return
-        # Store the data
-        self._mixer._zone_to_volume_map[zone_id] = level
-        self._mixer._zones_volume_received.add(zone_id)
+        zone = self._mixer.zones_by_id.get(zone_id)
+        if zone:
+            # Ignore heartbeat/old responses while a volume command is still debouncing
+            if zone.volume_debounce_task and not zone.volume_debounce_task.done():
+                self._mixer._logger.debug(
+                    "Ignoring volume response for zone %s while command is debounced",
+                    zone_id,
+                )
+                return
+            # Store the data
+            zone.volume = level
+            zone.volume_received = True
 
     def group_label_received(self, group_id: int, label: str):
         """Update the group label when received from device."""
@@ -135,7 +170,7 @@ class MixerListener(MixerResponseListener):
             group.name = label
             self._mixer.groups_by_name[label] = group
             # Track that we received this group's label
-            self._mixer._groups_labels_received.add(group_id)
+            group.label_received = True
     
     def group_status_received(self, group_id: int, enabled: bool, zones: list[int]):
         """Update the group status when received from device."""
@@ -144,33 +179,36 @@ class MixerListener(MixerResponseListener):
             group.enabled = enabled
             group.zones = zones
             # Track that we received this group's status
-            self._mixer._groups_status_received.add(group_id)
+            group.status_received = True
     
     def group_volume_level_received(self, group_id: int, level):
         """Track when a group's volume is received."""
-        # Ignore heartbeat/old responses while a volume command is still debouncing
-        if group_id in self._mixer._group_volume_debounce_tasks:
-            self._mixer._logger.debug(
-                "Ignoring group volume response for group %s while command is debounced",
-                group_id,
-            )
-            return
-        # Store the data
-        self._mixer._group_to_volume_map[group_id] = level
-        self._mixer._groups_volume_received.add(group_id)
+        group = self._mixer.groups_by_id.get(group_id)
+        if group:
+            # Ignore heartbeat/old responses while a volume command is still debouncing
+            if group.volume_debounce_task and not group.volume_debounce_task.done():
+                self._mixer._logger.debug(
+                    "Ignoring group volume response for group %s while command is debounced",
+                    group_id,
+                )
+                return
+            # Store the data
+            group.volume = level
+            group.volume_received = True
     
     def group_line_inputs_received(self, group_id: int, line_inputs: dict[int, bool]):
         """Track when a group's line input data is received."""
-        # Store the data
-        self._mixer._group_line_inputs_map[group_id] = line_inputs
-        # Protocol only calls this when all 8 line inputs are received
-        self._mixer._groups_line_inputs_received.add(group_id)
+        group = self._mixer.groups_by_id.get(group_id)
+        if group:
+            group.line_inputs = line_inputs
+            group.line_inputs_received = True
     
     def group_source_received(self, group_id: int, source_id: int):
         """Track when a group's source is received from the device."""
-        # Store the data
-        self._mixer._group_to_source_map[group_id] = source_id
-        self._mixer._groups_sources_received.add(group_id)
+        group = self._mixer.groups_by_id.get(group_id)
+        if group:
+            group.source = source_id
+            group.source_received = True
 
 
 class DCM1Mixer:
@@ -239,26 +277,6 @@ class DCM1Mixer:
         self.device_name: Optional[str] = None
         self.firmware_version: Optional[str] = None
 
-        # State tracking
-        self._zone_line_inputs_map = {}  # Maps zone_id to dict of line_id: enabled_bool
-        self._zone_to_source_map = {}  # Maps zone_id to source_id
-        self._zone_to_volume_map = {}  # Maps zone_id to volume level (int or "mute")
-        self._group_line_inputs_map = {}  # Maps group_id to dict of line_id: enabled_bool
-        self._group_to_source_map = {}  # Maps group_id to source_id
-        self._group_to_volume_map = {}  # Maps group_id to volume level (int or "mute")
-
-        # Track which IDs have received their attributes (for wait_for_* timeout logic)
-        self._sources_labels_received: set[int] = set()
-        self._zones_labels_received: set[int] = set()
-        self._zones_line_inputs_received: set[int] = set()
-        self._zones_sources_received: set[int] = set()
-        self._zones_volume_received: set[int] = set()
-        self._groups_status_received: set[int] = set()
-        self._groups_labels_received: set[int] = set()
-        self._groups_volume_received: set[int] = set()
-        self._groups_line_inputs_received: set[int] = set()
-        self._groups_sources_received: set[int] = set()
-
         # Connection state
         self._connected = False
         self._reconnect = True
@@ -281,16 +299,6 @@ class DCM1Mixer:
 
         # Track pending heartbeat queries to prevent duplicate polling
         self._pending_heartbeat_queries = set()
-
-        # Source/volume command debouncing
-        self._zone_source_debounce_tasks: dict[int, tuple[int, Task[Any]]] = {}
-        self._zone_volume_debounce_tasks: dict[int, tuple[Any, Task[Any]]] = {}
-        self._zone_source_confirm_task: dict[int, Task[Any]] = {}
-        self._zone_volume_confirm_task: dict[int, Task[Any]] = {}
-        self._group_source_debounce_tasks: dict[int, tuple[int, Task[Any]]] = {}
-        self._group_volume_debounce_tasks: dict[int, tuple[Any, Task[Any]]] = {}
-        self._group_source_confirm_task: dict[int, Task[Any]] = {}
-        self._group_volume_confirm_task: dict[int, Task[Any]] = {}
 
         # Track user commands that have been sent but not yet confirmed (inflight)
         # Format: command_sequence_number -> (priority, message)
@@ -346,30 +354,35 @@ class DCM1Mixer:
                 # Clear inflight commands tracking
                 self._inflight_commands.clear()
                 
-                # Cancel and clear all mid-flight debounce tasks
-                for task in self._zone_source_debounce_tasks.values():
-                    _, debounce_task = task
-                    if debounce_task and not debounce_task.done():
-                        debounce_task.cancel()
-                self._zone_source_debounce_tasks.clear()
-
-                for task in self._zone_volume_debounce_tasks.values():
-                    _, debounce_task = task
-                    if debounce_task and not debounce_task.done():
-                        debounce_task.cancel()
-                self._zone_volume_debounce_tasks.clear()
+                # Cancel and clear all mid-flight debounce/confirm tasks in zones
+                for zone in self.zones_by_id.values():
+                    if zone.source_debounce_task and not zone.source_debounce_task.done():
+                        zone.source_debounce_task.cancel()
+                    zone.source_debounce_task = None
+                    if zone.volume_debounce_task and not zone.volume_debounce_task.done():
+                        zone.volume_debounce_task.cancel()
+                    zone.volume_debounce_task = None
+                    if zone.source_confirm_task and not zone.source_confirm_task.done():
+                        zone.source_confirm_task.cancel()
+                    zone.source_confirm_task = None
+                    if zone.volume_confirm_task and not zone.volume_confirm_task.done():
+                        zone.volume_confirm_task.cancel()
+                    zone.volume_confirm_task = None
                 
-                for task in self._group_source_debounce_tasks.values():
-                    _, debounce_task = task
-                    if debounce_task and not debounce_task.done():
-                        debounce_task.cancel()
-                self._group_source_debounce_tasks.clear()
-
-                for task in self._group_volume_debounce_tasks.values():
-                    _, debounce_task = task
-                    if debounce_task and not debounce_task.done():
-                        debounce_task.cancel()
-                self._group_volume_debounce_tasks.clear()
+                # Cancel and clear all mid-flight debounce/confirm tasks in groups
+                for group in self.groups_by_id.values():
+                    if group.source_debounce_task and not group.source_debounce_task.done():
+                        group.source_debounce_task.cancel()
+                    group.source_debounce_task = None
+                    if group.volume_debounce_task and not group.volume_debounce_task.done():
+                        group.volume_debounce_task.cancel()
+                    group.volume_debounce_task = None
+                    if group.source_confirm_task and not group.source_confirm_task.done():
+                        group.source_confirm_task.cancel()
+                    group.source_confirm_task = None
+                    if group.volume_confirm_task and not group.volume_confirm_task.done():
+                        group.volume_confirm_task.cancel()
+                    group.volume_confirm_task = None
                                 
             self._connection_lost_timestamp = None
         
@@ -429,27 +442,33 @@ class DCM1Mixer:
     
     def get_zone_enabled_line_inputs(self, zone_id: int) -> dict[int, bool]:
         """Get which line inputs are enabled for a zone."""
-        return self._zone_line_inputs_map.get(zone_id, {}).copy()
+        zone = self.zones_by_id.get(zone_id)
+        return zone.line_inputs.copy() if zone else {}
     
     def get_zone_source(self, zone_id: int) -> Optional[int]:
         """Get the current source ID for a zone."""
-        return self._zone_to_source_map.get(zone_id, None)
+        zone = self.zones_by_id.get(zone_id)
+        return zone.source if zone else None
     
     def get_zone_volume_level(self, zone_id: int):
         """Get the volume level for a zone."""
-        return self._zone_to_volume_map.get(zone_id, None)
+        zone = self.zones_by_id.get(zone_id)
+        return zone.volume if zone else None
 
     def get_group_source(self, group_id: int) -> Optional[int]:
         """Get the current source ID for a group."""
-        return self._group_to_source_map.get(group_id, None)
+        group = self.groups_by_id.get(group_id)
+        return group.source if group else None
     
     def get_group_enabled_line_inputs(self, group_id: int) -> dict[int, bool]:
         """Get which line inputs are enabled for a group."""
-        return self._group_line_inputs_map.get(group_id, {}).copy()
+        group = self.groups_by_id.get(group_id)
+        return group.line_inputs.copy() if group else {}
 
     def get_group_volume_level(self, group_id: int):
         """Get the volume level for a group."""
-        return self._group_to_volume_map.get(group_id, None)
+        group = self.groups_by_id.get(group_id)
+        return group.volume if group else None
     
     def register_listener(self, listener):
         """Register external listener for mixer events."""
@@ -519,25 +538,26 @@ class DCM1Mixer:
             self._logger.error(f"Invalid zone_id {zone_id}, must be 1-{self._zone_count}")
             return
         
+        zone = self.zones_by_id.get(zone_id)
+        if not zone:
+            self._logger.error(f"Zone {zone_id} not found")
+            return
+        
         # Cancel any pending debounce timer for this zone
-        if zone_id in self._zone_source_debounce_tasks:
-            old_source, old_task = self._zone_source_debounce_tasks[zone_id]
-            if old_task and not old_task.done():
-                old_task.cancel()
-                self._logger.debug(f"Cancelled pending source command for zone {zone_id} (was set to {old_source})")
+        if zone.source_debounce_task and not zone.source_debounce_task.done():
+            zone.source_debounce_task.cancel()
+            self._logger.debug(f"Cancelled pending source command for zone {zone_id}")
         
         # Cancel any pending confirmation task for this zone
-        if zone_id in self._zone_source_confirm_task:
-            old_confirm_task = self._zone_source_confirm_task[zone_id]
-            if old_confirm_task and not old_confirm_task.done():
-                old_confirm_task.cancel()
-                self._logger.debug(f"Cancelled pending source confirmation for zone {zone_id}")
+        if zone.source_confirm_task and not zone.source_confirm_task.done():
+            zone.source_confirm_task.cancel()
+            self._logger.debug(f"Cancelled pending source confirmation for zone {zone_id}")
         
         # Create a new debounce task
         debounce_task = self._loop.create_task(
             self._debounce_zone_source_command(zone_id, source_id)
         )
-        self._zone_source_debounce_tasks[zone_id] = (source_id, debounce_task)
+        zone.source_debounce_task = debounce_task
 
     def send_zone_volume_level(self, zone_id: int, level):
         """Set volume level for a zone with debounce to prevent command collisions."""
@@ -564,25 +584,26 @@ class DCM1Mixer:
         
         self._logger.info(f"Volume request - Zone: {zone_id} to level: {level} (debounced)")
         
+        zone = self.zones_by_id.get(zone_id)
+        if not zone:
+            self._logger.error(f"Zone {zone_id} not found")
+            return
+        
         # Cancel any pending debounce timer for this zone
-        if zone_id in self._zone_volume_debounce_tasks:
-            old_level, old_task = self._zone_volume_debounce_tasks[zone_id]
-            if old_task and not old_task.done():
-                old_task.cancel()
-                self._logger.debug(f"Cancelled pending volume command for zone {zone_id} (was set to {old_level})")
+        if zone.volume_debounce_task and not zone.volume_debounce_task.done():
+            zone.volume_debounce_task.cancel()
+            self._logger.debug(f"Cancelled pending volume command for zone {zone_id}")
         
         # Cancel any pending confirmation task for this zone
-        if zone_id in self._zone_volume_confirm_task:
-            old_confirm_task = self._zone_volume_confirm_task[zone_id]
-            if old_confirm_task and not old_confirm_task.done():
-                old_confirm_task.cancel()
-                self._logger.debug(f"Cancelled pending volume confirmation for zone {zone_id}")
+        if zone.volume_confirm_task and not zone.volume_confirm_task.done():
+            zone.volume_confirm_task.cancel()
+            self._logger.debug(f"Cancelled pending volume confirmation for zone {zone_id}")
         
         # Create a new debounce task
         debounce_task = self._loop.create_task(
             self._debounce_zone_volume_command(zone_id, level_str, expected_level)
         )
-        self._zone_volume_debounce_tasks[zone_id] = (level, debounce_task)
+        zone.volume_debounce_task = debounce_task
 
     def send_group_source(self, source_id: int, group_id: int):
         """Set a group to use a specific source with debounce."""
@@ -597,25 +618,26 @@ class DCM1Mixer:
             self._logger.error(f"Invalid group_id {group_id}, must be 1-{self._group_count}")
             return
         
+        group = self.groups_by_id.get(group_id)
+        if not group:
+            self._logger.error(f"Group {group_id} not found")
+            return
+        
         # Cancel any pending debounce timer for this group
-        if group_id in self._group_source_debounce_tasks:
-            old_source, old_task = self._group_source_debounce_tasks[group_id]
-            if old_task and not old_task.done():
-                old_task.cancel()
-                self._logger.debug(f"Cancelled pending source command for group {group_id} (was set to {old_source})")
+        if group.source_debounce_task and not group.source_debounce_task.done():
+            group.source_debounce_task.cancel()
+            self._logger.debug(f"Cancelled pending source command for group {group_id}")
         
         # Cancel any pending confirmation task for this group
-        if group_id in self._group_source_confirm_task:
-            old_confirm_task = self._group_source_confirm_task[group_id]
-            if old_confirm_task and not old_confirm_task.done():
-                old_confirm_task.cancel()
-                self._logger.debug(f"Cancelled pending source confirmation for group {group_id}")
+        if group.source_confirm_task and not group.source_confirm_task.done():
+            group.source_confirm_task.cancel()
+            self._logger.debug(f"Cancelled pending source confirmation for group {group_id}")
         
         # Create a new debounce task
         debounce_task = self._loop.create_task(
             self._debounce_group_source_command(group_id, source_id)
         )
-        self._group_source_debounce_tasks[group_id] = (source_id, debounce_task)
+        group.source_debounce_task = debounce_task
 
     def send_group_volume_level(self, group_id: int, level):
         """Set volume level for a group with debounce."""
@@ -642,25 +664,26 @@ class DCM1Mixer:
         
         self._logger.info(f"Volume request - Group: {group_id} to level: {level} (debounced)")
         
+        group = self.groups_by_id.get(group_id)
+        if not group:
+            self._logger.error(f"Group {group_id} not found")
+            return
+        
         # Cancel any pending debounce timer for this group
-        if group_id in self._group_volume_debounce_tasks:
-            old_level, old_task = self._group_volume_debounce_tasks[group_id]
-            if old_task and not old_task.done():
-                old_task.cancel()
-                self._logger.debug(f"Cancelled pending volume command for group {group_id} (was set to {old_level})")
+        if group.volume_debounce_task and not group.volume_debounce_task.done():
+            group.volume_debounce_task.cancel()
+            self._logger.debug(f"Cancelled pending volume command for group {group_id}")
         
         # Cancel any pending confirmation task for this group
-        if group_id in self._group_volume_confirm_task:
-            old_confirm_task = self._group_volume_confirm_task[group_id]
-            if old_confirm_task and not old_confirm_task.done():
-                old_confirm_task.cancel()
-                self._logger.debug(f"Cancelled pending volume confirmation for group {group_id}")
+        if group.volume_confirm_task and not group.volume_confirm_task.done():
+            group.volume_confirm_task.cancel()
+            self._logger.debug(f"Cancelled pending volume confirmation for group {group_id}")
         
         # Create a new debounce task
         debounce_task = self._loop.create_task(
             self._debounce_group_volume_command(group_id, level_str, expected_level)
         )
-        self._group_volume_debounce_tasks[group_id] = (level, debounce_task)
+        group.volume_debounce_task = debounce_task
 
     # ========== Debounce tasks ==========
 
@@ -669,12 +692,14 @@ class DCM1Mixer:
         try:
             await asyncio.sleep(self._volume_debounce_delay)
             
+            zone = self.zones_by_id.get(zone_id)
+            if not zone:
+                return
+            
             # Check if this task was cancelled (superseded by newer request)
-            if zone_id in self._zone_source_debounce_tasks:
-                _, current_task = self._zone_source_debounce_tasks[zone_id]
-                if current_task != asyncio.current_task():
-                    self._logger.debug(f"Source command for zone {zone_id} to source {source_id} was superseded")
-                    return
+            if zone.source_debounce_task != asyncio.current_task():
+                self._logger.debug(f"Source command for zone {zone_id} to source {source_id} was superseded")
+                return
             
             # Send the actual command
             command = f"<Z{zone_id}.MU,S{source_id}/>\r"
@@ -684,27 +709,29 @@ class DCM1Mixer:
             # Auto-confirm if enabled
             if self._command_confirmation:
                 confirm_task = self._loop.create_task(self._confirm_zone_source(zone_id, source_id))
-                self._zone_source_confirm_task[zone_id] = confirm_task
+                zone.source_confirm_task = confirm_task
             
             # Clean up debounce tracker
-            if zone_id in self._zone_source_debounce_tasks:
-                del self._zone_source_debounce_tasks[zone_id]
+            zone.source_debounce_task = None
         except asyncio.CancelledError:
             self._logger.debug(f"Debounce task for zone {zone_id} source change was cancelled")
-            if zone_id in self._zone_source_debounce_tasks:
-                del self._zone_source_debounce_tasks[zone_id]
+            zone = self.zones_by_id.get(zone_id)
+            if zone:
+                zone.source_debounce_task = None
 
     async def _debounce_zone_volume_command(self, zone_id: int, level_str: str, expected_level: int):
         """Wait for debounce delay, then send zone volume command if not superseded."""
         try:
             await asyncio.sleep(self._volume_debounce_delay)
             
+            zone = self.zones_by_id.get(zone_id)
+            if not zone:
+                return
+            
             # Check if this task was cancelled (superseded by newer request)
-            if zone_id in self._zone_volume_debounce_tasks:
-                _, current_task = self._zone_volume_debounce_tasks[zone_id]
-                if current_task != asyncio.current_task():
-                    self._logger.debug(f"Volume command for zone {zone_id} level {level_str} was superseded")
-                    return
+            if zone.volume_debounce_task != asyncio.current_task():
+                self._logger.debug(f"Volume command for zone {zone_id} level {level_str} was superseded")
+                return
             
             # Send the actual command
             command = f"<Z{zone_id}.MU,L{level_str}/>\r"
@@ -714,27 +741,29 @@ class DCM1Mixer:
             # Auto-confirm if enabled
             if self._command_confirmation:
                 confirm_task = self._loop.create_task(self._confirm_zone_volume(zone_id, expected_level))
-                self._zone_volume_confirm_task[zone_id] = confirm_task
+                zone.volume_confirm_task = confirm_task
             
             # Clean up debounce tracker
-            if zone_id in self._zone_volume_debounce_tasks:
-                del self._zone_volume_debounce_tasks[zone_id]
+            zone.volume_debounce_task = None
         except asyncio.CancelledError:
             self._logger.debug(f"Debounce task for zone {zone_id} was cancelled")
-            if zone_id in self._zone_volume_debounce_tasks:
-                del self._zone_volume_debounce_tasks[zone_id]
+            zone = self.zones_by_id.get(zone_id)
+            if zone:
+                zone.volume_debounce_task = None
 
     async def _debounce_group_source_command(self, group_id: int, source_id: int):
         """Wait for debounce delay, then send group source command if not superseded."""
         try:
             await asyncio.sleep(self._volume_debounce_delay)
             
+            group = self.groups_by_id.get(group_id)
+            if not group:
+                return
+            
             # Check if this task was cancelled (superseded by newer request)
-            if group_id in self._group_source_debounce_tasks:
-                _, current_task = self._group_source_debounce_tasks[group_id]
-                if current_task != asyncio.current_task():
-                    self._logger.debug(f"Source command for group {group_id} to source {source_id} was superseded")
-                    return
+            if group.source_debounce_task != asyncio.current_task():
+                self._logger.debug(f"Source command for group {group_id} to source {source_id} was superseded")
+                return
             
             # Send the actual command
             command = f"<G{group_id}.MU,S{source_id}/>\r"
@@ -744,27 +773,29 @@ class DCM1Mixer:
             # Auto-confirm if enabled
             if self._command_confirmation:
                 confirm_task = self._loop.create_task(self._confirm_group_source(group_id, source_id))
-                self._group_source_confirm_task[group_id] = confirm_task
+                group.source_confirm_task = confirm_task
             
             # Clean up debounce tracker
-            if group_id in self._group_source_debounce_tasks:
-                del self._group_source_debounce_tasks[group_id]
+            group.source_debounce_task = None
         except asyncio.CancelledError:
             self._logger.debug(f"Debounce task for group {group_id} source change was cancelled")
-            if group_id in self._group_source_debounce_tasks:
-                del self._group_source_debounce_tasks[group_id]
+            group = self.groups_by_id.get(group_id)
+            if group:
+                group.source_debounce_task = None
 
     async def _debounce_group_volume_command(self, group_id: int, level_str: str, expected_level: int):
         """Wait for debounce delay, then send group volume command if not superseded."""
         try:
             await asyncio.sleep(self._volume_debounce_delay)
             
+            group = self.groups_by_id.get(group_id)
+            if not group:
+                return
+            
             # Check if this task was cancelled (superseded by newer request)
-            if group_id in self._group_volume_debounce_tasks:
-                _, current_task = self._group_volume_debounce_tasks[group_id]
-                if current_task != asyncio.current_task():
-                    self._logger.debug(f"Volume command for group {group_id} level {level_str} was superseded")
-                    return
+            if group.volume_debounce_task != asyncio.current_task():
+                self._logger.debug(f"Volume command for group {group_id} level {level_str} was superseded")
+                return
             
             # Send the actual command
             command = f"<G{group_id}.MU,L{level_str}/>\r"
@@ -774,15 +805,15 @@ class DCM1Mixer:
             # Auto-confirm if enabled
             if self._command_confirmation:
                 confirm_task = self._loop.create_task(self._confirm_group_volume(group_id, expected_level))
-                self._group_volume_confirm_task[group_id] = confirm_task
+                group.volume_confirm_task = confirm_task
             
             # Clean up debounce tracker
-            if group_id in self._group_volume_debounce_tasks:
-                del self._group_volume_debounce_tasks[group_id]
+            group.volume_debounce_task = None
         except asyncio.CancelledError:
             self._logger.debug(f"Debounce task for group {group_id} was cancelled")
-            if group_id in self._group_volume_debounce_tasks:
-                del self._group_volume_debounce_tasks[group_id]
+            group = self.groups_by_id.get(group_id)
+            if group:
+                group.volume_debounce_task = None
 
     # ========== Confirmation tasks ==========
 
@@ -1141,19 +1172,18 @@ class DCM1Mixer:
         if self._command_worker_task is not None:
             self._command_worker_task.cancel()
         
-        # Cancel confirmation tasks
-        for task in self._zone_source_confirm_task.values():
-            if task and not task.done():
-                task.cancel()
-        for task in self._zone_volume_confirm_task.values():
-            if task and not task.done():
-                task.cancel()
-        for task in self._group_source_confirm_task.values():
-            if task and not task.done():
-                task.cancel()
-        for task in self._group_volume_confirm_task.values():
-            if task and not task.done():
-                task.cancel()
+        # Cancel confirmation tasks in zone and group objects
+        for zone in self.zones_by_id.values():
+            if zone.source_confirm_task and not zone.source_confirm_task.done():
+                zone.source_confirm_task.cancel()
+            if zone.volume_confirm_task and not zone.volume_confirm_task.done():
+                zone.volume_confirm_task.cancel()
+        
+        for group in self.groups_by_id.values():
+            if group.source_confirm_task and not group.source_confirm_task.done():
+                group.source_confirm_task.cancel()
+            if group.volume_confirm_task and not group.volume_confirm_task.done():
+                group.volume_confirm_task.cancel()
         
         if hasattr(self, '_connection_watchdog_task') and self._connection_watchdog_task is not None:
             self._connection_watchdog_task.cancel()
@@ -1334,10 +1364,11 @@ class DCM1Mixer:
         start_time = self._loop.time()
         expected_source_ids = set(self.sources_by_id.keys())
         while self._loop.time() - start_time < timeout:
-            if self._sources_labels_received >= expected_source_ids:
+            all_received = all(self.sources_by_id[sid].label_received for sid in expected_source_ids)
+            if all_received:
                 return True
             await asyncio.sleep(0.1)
-        missing_sources = expected_source_ids - self._sources_labels_received
+        missing_sources = {sid for sid in expected_source_ids if not self.sources_by_id[sid].label_received}
         if missing_sources:
             print(f"Warning: Timeout waiting for source labels: {missing_sources}")
         return False
@@ -1347,17 +1378,21 @@ class DCM1Mixer:
         start_time = self._loop.time()
         expected_zone_ids = set(self.zones_by_id.keys())
         while self._loop.time() - start_time < timeout:
-            if (self._zones_labels_received >= expected_zone_ids and
-                self._zones_line_inputs_received >= expected_zone_ids and
-                self._zones_volume_received >= expected_zone_ids and
-                self._zones_sources_received >= expected_zone_ids):
+            all_received = all(
+                self.zones_by_id[zid].label_received and
+                self.zones_by_id[zid].line_inputs_received and
+                self.zones_by_id[zid].volume_received and
+                self.zones_by_id[zid].source_received
+                for zid in expected_zone_ids
+            )
+            if all_received:
                 return True
             await asyncio.sleep(0.1)
         # Timeout - log what we're missing
-        missing_labels = expected_zone_ids - self._zones_labels_received
-        missing_line_inputs = expected_zone_ids - self._zones_line_inputs_received
-        missing_volumes = expected_zone_ids - self._zones_volume_received
-        missing_sources = expected_zone_ids - self._zones_sources_received
+        missing_labels = {zid for zid in expected_zone_ids if not self.zones_by_id[zid].label_received}
+        missing_line_inputs = {zid for zid in expected_zone_ids if not self.zones_by_id[zid].line_inputs_received}
+        missing_volumes = {zid for zid in expected_zone_ids if not self.zones_by_id[zid].volume_received}
+        missing_sources = {zid for zid in expected_zone_ids if not self.zones_by_id[zid].source_received}
         if missing_labels:
             print(f"Warning: Timeout waiting for zone labels: {missing_labels}")
         if missing_line_inputs:
@@ -1373,19 +1408,23 @@ class DCM1Mixer:
         start_time = self._loop.time()
         expected_group_ids = set(self.groups_by_id.keys())
         while self._loop.time() - start_time < timeout:
-            if (self._groups_labels_received >= expected_group_ids and 
-                self._groups_status_received >= expected_group_ids and
-                self._groups_volume_received >= expected_group_ids and
-                self._groups_line_inputs_received >= expected_group_ids and
-                self._groups_sources_received >= expected_group_ids):
+            all_received = all(
+                self.groups_by_id[gid].label_received and
+                self.groups_by_id[gid].status_received and
+                self.groups_by_id[gid].volume_received and
+                self.groups_by_id[gid].line_inputs_received and
+                self.groups_by_id[gid].source_received
+                for gid in expected_group_ids
+            )
+            if all_received:
                 return True
             await asyncio.sleep(0.1)
         # Timeout - log what we're missing
-        missing_labels = expected_group_ids - self._groups_labels_received
-        missing_status = expected_group_ids - self._groups_status_received
-        missing_volume = expected_group_ids - self._groups_volume_received
-        missing_line_inputs = expected_group_ids - self._groups_line_inputs_received
-        missing_sources = expected_group_ids - self._groups_sources_received
+        missing_labels = {gid for gid in expected_group_ids if not self.groups_by_id[gid].label_received}
+        missing_status = {gid for gid in expected_group_ids if not self.groups_by_id[gid].status_received}
+        missing_volume = {gid for gid in expected_group_ids if not self.groups_by_id[gid].volume_received}
+        missing_line_inputs = {gid for gid in expected_group_ids if not self.groups_by_id[gid].line_inputs_received}
+        missing_sources = {gid for gid in expected_group_ids if not self.groups_by_id[gid].source_received}
         if missing_labels:
             print(f"Warning: Timeout waiting for group labels: {missing_labels}")
         if missing_status:
