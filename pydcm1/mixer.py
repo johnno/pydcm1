@@ -1,7 +1,7 @@
 """DCM1 Mixer - Enhanced with queue, heartbeat, inflight tracking, and reconnection.
 
 This module contains the high-level mixer abstraction with:
-- Domain objects (Zone, Source, Group)
+- Domain objects (Source, Zone, Group)
 - Debouncing logic for volume/source changes
 - Confirmation logic for commands
 - Queue management and command worker
@@ -651,32 +651,32 @@ class DCM1Mixer:
     
     def get_zone_enabled_line_inputs(self, zone_id: int) -> dict[int, bool]:
         """Get which line inputs are enabled for a zone."""
-        zone = self.zones_by_id.get(zone_id)
+        zone = self._get_zone_by_id(zone_id)
         return zone.line_inputs.copy() if zone else {}
     
     def get_zone_source(self, zone_id: int) -> Optional[int]:
         """Get the current source ID for a zone."""
-        zone = self.zones_by_id.get(zone_id)
+        zone = self._get_zone_by_id(zone_id)
         return zone.source if zone else None
     
     def get_zone_volume_level(self, zone_id: int):
         """Get the volume level for a zone."""
-        zone = self.zones_by_id.get(zone_id)
+        zone = self._get_zone_by_id(zone_id)
         return zone.volume if zone else None
 
     def get_group_source(self, group_id: int) -> Optional[int]:
         """Get the current source ID for a group."""
-        group = self.groups_by_id.get(group_id)
+        group = self._get_group_by_id(group_id)
         return group.source if group else None
     
     def get_group_enabled_line_inputs(self, group_id: int) -> dict[int, bool]:
         """Get which line inputs are enabled for a group."""
-        group = self.groups_by_id.get(group_id)
+        group = self._get_group_by_id(group_id)
         return group.line_inputs.copy() if group else {}
 
     def get_group_volume_level(self, group_id: int):
         """Get the volume level for a group."""
-        group = self.groups_by_id.get(group_id)
+        group = self._get_group_by_id(group_id)
         return group.volume if group else None
 
     def register_listener(self, listener):
@@ -718,37 +718,39 @@ class DCM1Mixer:
 
     def set_zone_source(self, zone_id: int, source_id: int):
         """Set a zone to use a specific source."""
-        zone = self._get_zone_for_write(zone_id)
+        zone = self._get_zone_by_id(zone_id)
         if zone:
             zone.set_source(source_id)  # Zone validates source_id
 
     def set_zone_volume(self, zone_id: int, level):
         """Set volume level for a zone."""
-        zone = self._get_zone_for_write(zone_id)
+        zone = self._get_zone_by_id(zone_id)
         if zone:
             zone.set_volume(level)  # Zone validates level
 
     def set_group_source(self, group_id: int, source_id: int):
         """Set a group to use a specific source."""
-        group = self._get_group_for_write(group_id)
+        group = self._get_group_by_id(group_id)
         if group:
             group.set_source(source_id)  # Group validates source_id
 
     def set_group_volume(self, group_id: int, level):
         """Set volume level for a group."""
-        group = self._get_group_for_write(group_id)
+        group = self._get_group_by_id(group_id)
         if group:
             group.set_volume(level)  # Group validates level
 
-    def _get_zone_for_write(self, zone_id: int) -> Optional[Zone]:
-        """Validate zone_id and return Zone for write operations."""
+    # ========== Helpers  ==========
+
+    def _get_zone_by_id(self, zone_id: int) -> Optional[Zone]:
+        """Validate zone_id and return Zone."""
         if not (1 <= zone_id <= self._zone_count):
             self._logger.error(f"Invalid zone_id {zone_id}, must be 1-{self._zone_count}")
             return None
         return self.zones_by_id.get(zone_id)
 
-    def _get_group_for_write(self, group_id: int) -> Optional[Group]:
-        """Validate group_id and return Group for write operations."""
+    def _get_group_by_id(self, group_id: int) -> Optional[Group]:
+        """Validate group_id and return Group."""
         if not (1 <= group_id <= self._group_count):
             self._logger.error(f"Invalid group_id {group_id}, must be 1-{self._group_count}")
             return None
