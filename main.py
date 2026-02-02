@@ -19,12 +19,10 @@ async def show_status(hostname: str, port: int):
     await mixer.async_connect()
     
     # Wait for all initial protocol queries to be sent before displaying status
-    protocol = mixer.protocol
-    print("Waiting for all protocol commands to be sent...")
+    print("Waiting for all mixer commands to be sent...")
     while True:
-        if hasattr(protocol, '_command_queue') and protocol._command_queue.empty():
-            if not hasattr(protocol, '_worker_processing') or not protocol._worker_processing:
-                break
+        if mixer._command_queue.empty():
+            break
         await asyncio.sleep(0.1)
     
     print("\nZone Status:")
@@ -34,7 +32,7 @@ async def show_status(hostname: str, port: int):
         zone = mixer.zones_by_id[zone_id]
         enabled_inputs = mixer.get_zone_enabled_line_inputs(zone_id)
         source_id = mixer.get_zone_source(zone_id)
-        volume = mixer.protocol.get_zone_volume_level(zone_id)
+        volume = mixer.get_zone_volume_level(zone_id)
 
         # Format volume display
         if volume == "mute":
@@ -73,7 +71,7 @@ async def show_status(hostname: str, port: int):
         zones_str = ",".join(str(z) for z in group.zones) if group.zones else "none"
         
         # Get volume for the group
-        volume = mixer.protocol.get_group_volume_level(group_id)
+        volume = mixer.get_group_volume_level(group_id)
         if volume == "mute":
             volume_str = "MUTE"
         elif volume is not None:
@@ -83,7 +81,7 @@ async def show_status(hostname: str, port: int):
             volume_str = "unknown"
         
         # Get line inputs for the group
-        enabled_inputs = mixer.protocol.get_group_enabled_line_inputs(group_id)
+        enabled_inputs = mixer.get_group_enabled_line_inputs(group_id)
         if enabled_inputs:
             enabled_list = [str(line_id) for line_id, enabled in sorted(enabled_inputs.items()) if enabled]
             inputs_str = ",".join(enabled_list) if enabled_list else "none"

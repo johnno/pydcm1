@@ -1,7 +1,37 @@
-from typing import Optional
+"""DCM1 Mixer - Enhanced with queue, heartbeat, inflight tracking, and reconnection.
+
+This module contains the high-level mixer abstraction with:
+- Domain objects (Zone, Source, Group)
+- Debouncing logic for volume/source changes
+- Confirmation logic for commands
+- Queue management and command worker
+- Heartbeat/polling for syncing with physical controls
+- Inflight command tracking and recovery
+- Reconnection logic and watchdog
+- MixerProtocol instance creation and management
+
+This class implements MixerResponseListener to receive callbacks from the transport."""
+
+import asyncio
+import logging
+import re
+import time
+from asyncio import PriorityQueue, Task
+from typing import Any, Optional
 
 from pydcm1.listener import MultiplexingListener, MixerResponseListener
 from pydcm1.protocol import MixerProtocol
+
+# Command priority levels (lower number = higher priority)
+# Design: WRITE commands have higher priority than READ queries
+# Rationale: In a control system, state-changing operations (writes) must execute
+# immediately in response to user actions. Read queries (status polls, confirmation
+# checks) can execute later with lower priority. This ensures:
+# - User commands execute without delay
+# - Confirmation queries trail behind, reading the latest state
+# - Only writes are tracked for recovery on reconnection
+PRIORITY_WRITE = 10   # Write commands that change device state (SET volume, SET source)
+PRIORITY_READ = 20    # Read commands that query device state (all queries, confirmations)
 
 
 class Zone:
@@ -11,11 +41,27 @@ class Zone:
         self.name = name
 
 
+class Source:
+    """Represents a source in the DCM1 mixer."""
+    def __init__(self, source_id: int, name: str):
+        self.id = source_id
+        self.name = name
+
+
+class Group:
+    """Represents a group in the DCM1 mixer."""
+    def __init__(self, group_id: int, name: str, enabled: bool = False, zones: list[int] = None):
+        self.id = group_id
+        self.name = name
+        self.enabled = enabled
+        self.zones = zones if zones else []
+
+
 class MixerListener(MixerResponseListener):
     """Listener that tracks mixer state updates and reception timestamps.
     
     Note: Most state management (sources, volumes, line inputs, zone/group sources) is handled
-    directly by protocol.py. This listener primarily tracks when specific data has been received
+    directly by this mixer class. This listener primarily tracks when specific data has been received
     (for wait_for_* timeout logic). Label updates are still applied here since zones/sources/groups
     are high-level objects in this mixer class. This explains why many callback parameters go unused.
     """
@@ -53,23 +99,28 @@ class MixerListener(MixerResponseListener):
 
     def zone_line_inputs_received(self, zone_id: int, line_inputs: dict[int, bool]):
         """Track when a zone's line input data is received."""
+        # Store the data
+        self._mixer._zone_line_inputs_map[zone_id] = line_inputs
         # Protocol only calls this when all 8 line inputs are received
         self._mixer._zones_line_inputs_received.add(zone_id)
 
     def zone_source_received(self, zone_id: int, source_id: int):
-        """Track when a zone's source is received from the device.
-        
-        Note: source_id is not used because protocol.py already stores the source state.
-        This listener only marks that reception occurred (for wait_for_zone_data timeout).
-        """
+        """Track when a zone's source is received from the device."""
+        # Store the data
+        self._mixer._zone_to_source_map[zone_id] = source_id
         self._mixer._zones_sources_received.add(zone_id)
 
     def zone_volume_level_received(self, zone_id: int, level):
-        """Track when a zone's volume is received from the device.
-        
-        Note: level is not used because protocol.py already stores the volume state.
-        This listener only marks that reception occurred (for wait_for_zone_data timeout).
-        """
+        """Track when a zone's volume is received from the device."""
+        # Ignore heartbeat/old responses while a volume command is still debouncing
+        if zone_id in self._mixer._zone_volume_debounce_tasks:
+            self._mixer._logger.debug(
+                "Ignoring volume response for zone %s while command is debounced",
+                zone_id,
+            )
+            return
+        # Store the data
+        self._mixer._zone_to_volume_map[zone_id] = level
         self._mixer._zones_volume_received.add(zone_id)
 
     def group_label_received(self, group_id: int, label: str):
@@ -96,77 +147,273 @@ class MixerListener(MixerResponseListener):
             self._mixer._groups_status_received.add(group_id)
     
     def group_volume_level_received(self, group_id: int, level):
-        """Track when a group's volume is received.
-        
-        Note: level is not used because protocol.py already stores the volume state.
-        This listener only marks that reception occurred (for wait_for_group_data timeout).
-        """
+        """Track when a group's volume is received."""
+        # Ignore heartbeat/old responses while a volume command is still debouncing
+        if group_id in self._mixer._group_volume_debounce_tasks:
+            self._mixer._logger.debug(
+                "Ignoring group volume response for group %s while command is debounced",
+                group_id,
+            )
+            return
+        # Store the data
+        self._mixer._group_to_volume_map[group_id] = level
         self._mixer._groups_volume_received.add(group_id)
     
     def group_line_inputs_received(self, group_id: int, line_inputs: dict[int, bool]):
         """Track when a group's line input data is received."""
+        # Store the data
+        self._mixer._group_line_inputs_map[group_id] = line_inputs
         # Protocol only calls this when all 8 line inputs are received
         self._mixer._groups_line_inputs_received.add(group_id)
     
     def group_source_received(self, group_id: int, source_id: int):
-        """Track when a group's source is received from the device.
-        
-        Note: source_id is not used because protocol.py already stores the source state.
-        This listener only marks that reception occurred (for wait_for_group_data timeout).
-        """
-        self._mixer._groups_sources_received.add(group_id)    
-
-class Source:
-    """Represents a source in the DCM1 mixer."""
-    def __init__(self, source_id: int, name: str):
-        self.id = source_id
-        self.name = name
-
-
-class Group:
-    """Represents a group in the DCM1 mixer."""
-    def __init__(self, group_id: int, name: str, enabled: bool = False, zones: list[int] = None):
-        self.id = group_id
-        self.name = name
-        self.enabled = enabled
-        self.zones = zones if zones else []
+        """Track when a group's source is received from the device."""
+        # Store the data
+        self._mixer._group_to_source_map[group_id] = source_id
+        self._mixer._groups_sources_received.add(group_id)
 
 
 class DCM1Mixer:
+    """High-level DCM1 mixer control with queue, heartbeat, and reconnection management.
+    
+    This class:
+    - Creates and manages MixerProtocol instance
+    - Implements MixerResponseListener to receive transport callbacks
+    - Manages command queue, worker, heartbeat, watchdog
+    - Tracks inflight commands for recovery on reconnection
+    - Debounces volume and source changes
+    - Confirms commands by querying device
+    - Handles reconnection logic
+    - Manages domain objects (Zone, Source, Group)
+    """
 
-    def __init__(self, hostname, port, enable_heartbeat=True):
-        self.hostname : str = hostname
+    def __init__(self, hostname, port, enable_heartbeat=True, heartbeat_time=10,
+                 reconnect_time=10, command_confirmation=True):
+        """Initialize mixer.
+        
+        Args:
+            hostname: DCM1 device hostname or IP
+            port: TCP port (usually 10001)
+            enable_heartbeat: Whether to enable periodic status polling
+            heartbeat_time: Seconds between heartbeat polls
+            reconnect_time: Seconds to wait between reconnection attempts
+            command_confirmation: Whether to auto-confirm commands
+        """
+        self.hostname: str = hostname
+        self._port = port
+        self._enable_heartbeat = enable_heartbeat
+        self._heartbeat_time = heartbeat_time
+        self._reconnect_time = reconnect_time
+        self._command_confirmation = command_confirmation
+        
+        self._logger = logging.getLogger(__name__)
+        self._loop = asyncio.get_event_loop()
+
+        # DCM1 has 8 zones, 8 line sources, and 4 groups (hardcoded)
+        self._zone_count: int = 8
+        self._source_count: int = 8
+        self._group_count: int = 4
+
+        # Retry inflight commands on confirmation failures due to shared serial line interference
+        self._retry_on_confirmation_timeout: bool = True
+        self._retry_on_confirmation_mismatch: bool = True
+        # If connection is down for longer than this, clear inflight commands on reconnect
+        # because users may have used the front panel and our commands are now stale
+        self._clear_queue_after_reconnection_delay_seconds: float = 60.0
+
+        self._max_retries: int = 1  # Max retry attempts per command
+
+        # Minimum delay between commands to avoid MCU serial port clashes (in seconds)
+        self._min_send_delay_seconds: float = 0.1
+
+        self._volume_debounce_delay: float = 0.5  # Wait 500ms after last request before sending
+
+        # Domain objects
+        self.zones_by_id: dict[int, Zone] = {}
+        self.zones_by_name: dict[str, Zone] = {}
+        self.sources_by_id: dict[int, Source] = {}
+        self.sources_by_name: dict[str, Source] = {}
+        self.groups_by_id: dict[int, Group] = {}
+        self.groups_by_name: dict[str, Group] = {}
+        self.mac: Optional[str] = None
+        self.device_name: Optional[str] = None
+        self.firmware_version: Optional[str] = None
+
+        # State tracking
+        self._zone_line_inputs_map = {}  # Maps zone_id to dict of line_id: enabled_bool
+        self._zone_to_source_map = {}  # Maps zone_id to source_id
+        self._zone_to_volume_map = {}  # Maps zone_id to volume level (int or "mute")
+        self._group_line_inputs_map = {}  # Maps group_id to dict of line_id: enabled_bool
+        self._group_to_source_map = {}  # Maps group_id to source_id
+        self._group_to_volume_map = {}  # Maps group_id to volume level (int or "mute")
+
+        # Track which IDs have received their attributes (for wait_for_* timeout logic)
+        self._sources_labels_received: set[int] = set()
+        self._zones_labels_received: set[int] = set()
+        self._zones_line_inputs_received: set[int] = set()
+        self._zones_sources_received: set[int] = set()
+        self._zones_volume_received: set[int] = set()
+        self._groups_status_received: set[int] = set()
+        self._groups_labels_received: set[int] = set()
+        self._groups_volume_received: set[int] = set()
+        self._groups_line_inputs_received: set[int] = set()
+        self._groups_sources_received: set[int] = set()
+
+        # Connection state
+        self._connected = False
+        self._reconnect = True
+        self._connection_lost_timestamp: Optional[float] = None
+
+        # Tasks
+        self._heartbeat_task: Optional[Task[Any]] = None
+        self._command_worker_task: Optional[Task[Any]] = None
+        self._connection_watchdog_task: Optional[Task[Any]] = None
+
+        # Track last send time to avoid clashes between commands
+        self._last_send_timestamp: float = 0.0
+        # Track last received data time to detect silent/stalled connections
+        self._last_receive_timestamp: float = time.time()
+
+        # Priority queue to serialize commands (user commands jump ahead of heartbeat)
+        self._command_queue: PriorityQueue = PriorityQueue()
+        self._queued_commands_set: set[str] = set()  # Deduplication set for queued commands
+        self._command_sequence_number: int = 0  # Sequence number for FIFO order within same priority
+
+        # Track pending heartbeat queries to prevent duplicate polling
+        self._pending_heartbeat_queries = set()
+
+        # Source/volume command debouncing
+        self._zone_source_debounce_tasks: dict[int, tuple[int, Task[Any]]] = {}
+        self._zone_volume_debounce_tasks: dict[int, tuple[Any, Task[Any]]] = {}
+        self._zone_source_confirm_task: dict[int, Task[Any]] = {}
+        self._zone_volume_confirm_task: dict[int, Task[Any]] = {}
+        self._group_source_debounce_tasks: dict[int, tuple[int, Task[Any]]] = {}
+        self._group_volume_debounce_tasks: dict[int, tuple[Any, Task[Any]]] = {}
+        self._group_source_confirm_task: dict[int, Task[Any]] = {}
+        self._group_volume_confirm_task: dict[int, Task[Any]] = {}
+
+        # Track user commands that have been sent but not yet confirmed (inflight)
+        # Format: command_sequence_number -> (priority, message)
+        self._inflight_commands: dict[int, tuple[int, str]] = {}
+        # Track retry attempts per command
+        self._inflight_command_reenqueue_counts: dict[int, int] = {}
+
+        # Create multiplexing listener for external listeners
         self._multiplex_callback = MultiplexingListener()
-        self.protocol = MixerProtocol(hostname, port, self._multiplex_callback, enable_heartbeat=enable_heartbeat)
-        self.zones_by_id : dict[int, Zone] = {}
-        self.zones_by_name : dict[str, Zone] = {}
-        self.sources_by_id : dict[int, Source] = {}
-        self.sources_by_name : dict[str, Source] = {}
-        self.groups_by_id : dict[int, Group] = {}
-        self.groups_by_name : dict[str, Group] = {}
-        self.mac : Optional[str] = None
-        self.device_name : Optional[str] = None
-        self.firmware_version : Optional[str] = None
-
-        # Track which source IDs have received their labels
-        self._sources_labels_received : set[int] = set()
-
-        # Track which zone IDs have have received their attributes
-        self._zones_labels_received : set[int] = set()
-        self._zones_line_inputs_received : set[int] = set()
-        self._zones_sources_received : set[int] = set()
-        self._zones_volume_received : set[int] = set()
-
-        # Track which group IDs have received their attributes
-        self._groups_status_received : set[int] = set()
-        self._groups_labels_received : set[int] = set()
-        self._groups_volume_received : set[int] = set()
-        self._groups_line_inputs_received : set[int] = set()
-        self._groups_sources_received : set[int] = set()
-                
-        # Register listener to update mixer state
+        
+        # Register internal listener to update mixer state
         self._mixer_listener = MixerListener(self)
         self._multiplex_callback.register_listener(self._mixer_listener)
+        
+        # Create protocol instance
+        self._protocol = MixerProtocol(self._multiplex_callback)
+
+    # ========== Properties ==========
+
+    @property
+    def protocol(self):
+        """Access to internal protocol instance for backward compatibility."""
+        return self._protocol
+
+    # ========== MixerResponseListener implementation (pass-through to multiplexer) ==========
+    
+    def connected(self):
+        """Called by protocol when connection is established."""
+        self._logger.info("Mixer connected")
+        self._connected = True
+        self._last_receive_timestamp = time.time()
+        
+        # Cancel any existing tasks before creating new ones
+        if self._command_worker_task is not None and not self._command_worker_task.done():
+            self._command_worker_task.cancel()
+        if self._heartbeat_task is not None and not self._heartbeat_task.done():
+            self._heartbeat_task.cancel()
+        
+        # Check if connection was down for a long time
+        reenqueue_inflight_commands = True
+        if self._connection_lost_timestamp is not None:
+            # Clear pending heartbeat queries since the device won't respond to stale requests
+            self._pending_heartbeat_queries.clear()
+
+            downtime_duration_seconds = time.time() - self._connection_lost_timestamp
+            if downtime_duration_seconds > self._clear_queue_after_reconnection_delay_seconds:
+                reenqueue_inflight_commands = False
+
+                self._logger.warning(
+                    f"Connection was down for {downtime_duration_seconds:.1f}s (threshold: {self._clear_queue_after_reconnection_delay_seconds}s), "
+                    f"clearing {len(self._inflight_commands)} stale inflight commands and debounce/confirmation tasks"
+                )
+                # Clear inflight commands tracking
+                self._inflight_commands.clear()
+                
+                # Cancel and clear all mid-flight debounce tasks
+                for task in self._zone_source_debounce_tasks.values():
+                    _, debounce_task = task
+                    if debounce_task and not debounce_task.done():
+                        debounce_task.cancel()
+                self._zone_source_debounce_tasks.clear()
+
+                for task in self._zone_volume_debounce_tasks.values():
+                    _, debounce_task = task
+                    if debounce_task and not debounce_task.done():
+                        debounce_task.cancel()
+                self._zone_volume_debounce_tasks.clear()
+                
+                for task in self._group_source_debounce_tasks.values():
+                    _, debounce_task = task
+                    if debounce_task and not debounce_task.done():
+                        debounce_task.cancel()
+                self._group_source_debounce_tasks.clear()
+
+                for task in self._group_volume_debounce_tasks.values():
+                    _, debounce_task = task
+                    if debounce_task and not debounce_task.done():
+                        debounce_task.cancel()
+                self._group_volume_debounce_tasks.clear()
+                                
+            self._connection_lost_timestamp = None
+        
+        # Re-queue any inflight user commands that were sent but not confirmed before disconnect
+        if reenqueue_inflight_commands and self._inflight_commands:
+            self._logger.warning(f"Re-queueing {len(self._inflight_commands)} inflight user commands after reconnection")
+            # Clear retry counts for fresh quota on new connection
+            self._inflight_command_reenqueue_counts.clear()
+            # Sort by sequence_number to maintain FIFO order within inflight commands
+            for sequence_number in sorted(self._inflight_commands.keys()):
+                priority, message = self._inflight_commands[sequence_number]
+                self._logger.info(f"Re-queueing pending command #{sequence_number}: {message.strip()}")
+                try:
+                    self._command_queue.put_nowait((priority, sequence_number, (message, None)))
+                except asyncio.QueueFull:
+                    self._logger.error(f"Queue full, could not re-queue pending command #{sequence_number}")
+        
+        # Start command worker and heartbeat tasks
+        self._command_worker_task = self._loop.create_task(self._command_worker())
+        if self._enable_heartbeat:
+            self._heartbeat_task = self._loop.create_task(self._heartbeat())
+        
+        # Start connection watchdog to detect silent disconnections
+        self._connection_watchdog_task = self._loop.create_task(self._connection_watchdog())
+        
+        # Query configuration
+        self.enqueue_source_label_query_commands()
+        self.enqueue_zone_label_query_commands()
+        self.enqueue_zone_line_input_enable_query_commands()
+        self.enqueue_group_status_query_commands()
+        self.enqueue_group_label_query_commands()
+        self.enqueue_group_line_input_enable_query_commands()
+
+        # Query operational status
+        self.enqueue_zone_source_query_commands()
+        self.enqueue_zone_volume_level_query_commands()
+        self.enqueue_group_source_query_commands()
+        self.enqueue_group_volume_level_query_commands()
+
+    def disconnected(self):
+        """Called by protocol when connection is lost."""
+        self._handle_connection_broken()
+
+    # ========== Public API ==========
 
     @property
     def source_names(self):
@@ -181,80 +428,41 @@ class DCM1Mixer:
         return list(self.groups_by_name.keys())
     
     def get_zone_enabled_line_inputs(self, zone_id: int) -> dict[int, bool]:
-        """Get which line inputs are enabled for a zone.
-        
-        Args:
-            zone_id: Zone ID (1-8)
-        
-        Returns:
-            Dictionary mapping line input ID (1-8) to enabled status (True/False)
-        """
-        return self.protocol.get_zone_enabled_line_inputs(zone_id)
+        """Get which line inputs are enabled for a zone."""
+        return self._zone_line_inputs_map.get(zone_id, {}).copy()
     
     def get_zone_source(self, zone_id: int) -> Optional[int]:
-        """Get the current source ID for a zone.
-        
-        Args:
-            zone_id: Zone ID (1-8)
-        
-        Returns:
-            Source ID (1-8) or None if not known
-        """
-        return self.protocol.get_zone_source(zone_id)
+        """Get the current source ID for a zone."""
+        return self._zone_to_source_map.get(zone_id, None)
     
     def get_zone_volume_level(self, zone_id: int):
-        """Get the volume level for a zone.
-        
-        Args:
-            zone_id: Zone ID (1-8)
-        
-        Returns:
-            Volume level (int 0-61) or "mute" or None if not known
-        """
-        return self.protocol.get_zone_volume_level(zone_id)
+        """Get the volume level for a zone."""
+        return self._zone_to_volume_map.get(zone_id, None)
 
     def get_group_source(self, group_id: int) -> Optional[int]:
-        """Get the current source ID for a group.
-        
-        Args:
-            group_id: Group ID (1-4)
-        
-        Returns:
-            Source ID (1-8) or None if not known
-        """
-        return self.protocol.get_group_source(group_id)
+        """Get the current source ID for a group."""
+        return self._group_to_source_map.get(group_id, None)
     
     def get_group_enabled_line_inputs(self, group_id: int) -> dict[int, bool]:
-        """Get which line inputs are enabled for a group.
-        
-        Args:
-            group_id: Group ID (1-4)
-        
-        Returns:
-            Dictionary mapping line input ID (1-8) to enabled status (True/False)
-        """
-        return self.protocol.get_group_enabled_line_inputs(group_id)
+        """Get which line inputs are enabled for a group."""
+        return self._group_line_inputs_map.get(group_id, {}).copy()
 
     def get_group_volume_level(self, group_id: int):
-        """Get the volume level for a group.
-        
-        Args:
-            group_id: Group ID (1-4)
-        
-        Returns:
-            Volume level (int 0-61) or "mute" or None if not known
-        """
-        return self.protocol.get_group_volume_level(group_id)    
+        """Get the volume level for a group."""
+        return self._group_to_volume_map.get(group_id, None)
     
     def register_listener(self, listener):
+        """Register external listener for mixer events."""
         self._multiplex_callback.register_listener(listener)
 
     def unregister_listener(self, listener):
+        """Unregister external listener."""
         self._multiplex_callback.unregister_listener(listener)
 
     async def async_connect(self):
-        # Initialize zones, sources, and groups based on protocol configuration
-        for i in range(1, self.protocol._zone_count + 1):
+        """Connect to the DCM1 mixer."""
+        # Initialize zones, sources, and groups
+        for i in range(1, self._zone_count + 1):
             zone = Zone(i, f"Zone {i}")
             self.zones_by_id[i] = zone
             self.zones_by_name[zone.name] = zone
@@ -264,56 +472,837 @@ class DCM1Mixer:
             self.sources_by_name[source.name] = source
         
         # Initialize groups
-        for i in range(1, self.protocol._group_count + 1):
+        for i in range(1, self._group_count + 1):
             group = Group(i, f"Group {i}")
             self.groups_by_id[i] = group
             self.groups_by_name[group.name] = group
         
-        # Note that connecting will also start querying all mixer state
-        # and MixerListener will populate the zone/source/group names.
-        await self.protocol.async_connect()
+        # Create connection to device
+        transport, protocol = await self._loop.create_connection(
+            lambda: self._protocol, host=self.hostname, port=self._port
+        )
 
     def close(self):
-        self.protocol.close()
+        """Close the connection and stop reconnection attempts."""
+        self._reconnect = False
+        if self._protocol._transport:
+            self._protocol._transport.close()
 
     def set_zone_source(self, zone_id: int, source_id: int):
         """Set a zone to use a specific source."""
-        self.protocol.send_zone_source(source_id, zone_id)
+        self.send_zone_source(source_id, zone_id)
 
     def set_zone_volume(self, zone_id: int, level):
-        """Set volume level for a zone.
-        
-        Args:
-            zone_id: Zone ID (1-8)
-            level: Volume level - int (0-61 where 20 = -20dB, 62 for mute) or "mute"
-        """
-        self.protocol.send_zone_volume_level(zone_id, level)
+        """Set volume level for a zone."""
+        self.send_zone_volume_level(zone_id, level)
 
     def set_group_source(self, group_id: int, source_id: int):
-        """Set a group to use a specific source.
-        
-        Args:
-            group_id: Group ID (1-4)
-            source_id: Source ID (1-8)
-        """
-        self.protocol.send_group_source(source_id, group_id)
+        """Set a group to use a specific source."""
+        self.send_group_source(source_id, group_id)
 
     def set_group_volume(self, group_id: int, level):
-        """Set volume level for a group.
-        
-        Args:
-            group_id: Group ID (1-4)
-            level: Volume level - int (0-61 where 20 = -20dB, 62 for mute) or "mute"
-        """
-        self.protocol.send_group_volume_level(group_id, level)
+        """Set volume level for a group."""
+        self.send_group_volume_level(group_id, level)
 
-    # Methods below are a hangover from when main.py queried attributes
-    # directly not knowing that all attributes are queried on connection
-    # by protocol.py.
-    #
-    # protocol.py is doing more than it should as vibe coding resulted
-    # in it putting everything there, so it models the entire mixer state
-    # which is what this class should be doing.
+    # ========== Command sending methods ==========
+
+    def send_zone_source(self, source_id: int, zone_id: int):
+        """Set source for a zone with debounce to prevent command collisions."""
+        self._logger.info(
+            f"Source request - Zone: {zone_id} to source: {source_id} (debounced)"
+        )
+        # Validate inputs early
+        if not (1 <= source_id <= self._source_count):
+            self._logger.error(f"Invalid source_id {source_id}, must be 1-{self._source_count}")
+            return
+        if not (1 <= zone_id <= self._zone_count):
+            self._logger.error(f"Invalid zone_id {zone_id}, must be 1-{self._zone_count}")
+            return
+        
+        # Cancel any pending debounce timer for this zone
+        if zone_id in self._zone_source_debounce_tasks:
+            old_source, old_task = self._zone_source_debounce_tasks[zone_id]
+            if old_task and not old_task.done():
+                old_task.cancel()
+                self._logger.debug(f"Cancelled pending source command for zone {zone_id} (was set to {old_source})")
+        
+        # Cancel any pending confirmation task for this zone
+        if zone_id in self._zone_source_confirm_task:
+            old_confirm_task = self._zone_source_confirm_task[zone_id]
+            if old_confirm_task and not old_confirm_task.done():
+                old_confirm_task.cancel()
+                self._logger.debug(f"Cancelled pending source confirmation for zone {zone_id}")
+        
+        # Create a new debounce task
+        debounce_task = self._loop.create_task(
+            self._debounce_zone_source_command(zone_id, source_id)
+        )
+        self._zone_source_debounce_tasks[zone_id] = (source_id, debounce_task)
+
+    def send_zone_volume_level(self, zone_id: int, level):
+        """Set volume level for a zone with debounce to prevent command collisions."""
+        # Validate inputs early
+        if not (1 <= zone_id <= self._zone_count):
+            self._logger.error(f"Invalid zone_id {zone_id}, must be 1-{self._zone_count}")
+            return
+        
+        if isinstance(level, str):
+            if level.lower() != "mute":
+                self._logger.error(f"Invalid level string '{level}', must be 'mute' or integer 0-62")
+                return
+            level_str = "62"
+            expected_level = 62
+        elif isinstance(level, int):
+            if not (0 <= level <= 62):
+                self._logger.error(f"Invalid level {level}, must be 0-62 (62=mute)")
+                return
+            level_str = str(level)
+            expected_level = level
+        else:
+            self._logger.error(f"Invalid level type {type(level)}, must be int or 'mute'")
+            return
+        
+        self._logger.info(f"Volume request - Zone: {zone_id} to level: {level} (debounced)")
+        
+        # Cancel any pending debounce timer for this zone
+        if zone_id in self._zone_volume_debounce_tasks:
+            old_level, old_task = self._zone_volume_debounce_tasks[zone_id]
+            if old_task and not old_task.done():
+                old_task.cancel()
+                self._logger.debug(f"Cancelled pending volume command for zone {zone_id} (was set to {old_level})")
+        
+        # Cancel any pending confirmation task for this zone
+        if zone_id in self._zone_volume_confirm_task:
+            old_confirm_task = self._zone_volume_confirm_task[zone_id]
+            if old_confirm_task and not old_confirm_task.done():
+                old_confirm_task.cancel()
+                self._logger.debug(f"Cancelled pending volume confirmation for zone {zone_id}")
+        
+        # Create a new debounce task
+        debounce_task = self._loop.create_task(
+            self._debounce_zone_volume_command(zone_id, level_str, expected_level)
+        )
+        self._zone_volume_debounce_tasks[zone_id] = (level, debounce_task)
+
+    def send_group_source(self, source_id: int, group_id: int):
+        """Set a group to use a specific source with debounce."""
+        self._logger.info(
+            f"Source request - Group: {group_id} to source: {source_id} (debounced)"
+        )
+        # Validate inputs early
+        if not (1 <= source_id <= self._source_count):
+            self._logger.error(f"Invalid source_id {source_id}, must be 1-{self._source_count}")
+            return
+        if not (1 <= group_id <= self._group_count):
+            self._logger.error(f"Invalid group_id {group_id}, must be 1-{self._group_count}")
+            return
+        
+        # Cancel any pending debounce timer for this group
+        if group_id in self._group_source_debounce_tasks:
+            old_source, old_task = self._group_source_debounce_tasks[group_id]
+            if old_task and not old_task.done():
+                old_task.cancel()
+                self._logger.debug(f"Cancelled pending source command for group {group_id} (was set to {old_source})")
+        
+        # Cancel any pending confirmation task for this group
+        if group_id in self._group_source_confirm_task:
+            old_confirm_task = self._group_source_confirm_task[group_id]
+            if old_confirm_task and not old_confirm_task.done():
+                old_confirm_task.cancel()
+                self._logger.debug(f"Cancelled pending source confirmation for group {group_id}")
+        
+        # Create a new debounce task
+        debounce_task = self._loop.create_task(
+            self._debounce_group_source_command(group_id, source_id)
+        )
+        self._group_source_debounce_tasks[group_id] = (source_id, debounce_task)
+
+    def send_group_volume_level(self, group_id: int, level):
+        """Set volume level for a group with debounce."""
+        # Validate inputs early
+        if not (1 <= group_id <= self._group_count):
+            self._logger.error(f"Invalid group_id {group_id}, must be 1-{self._group_count}")
+            return
+        
+        if isinstance(level, str):
+            if level.lower() != "mute":
+                self._logger.error(f"Invalid level string '{level}', must be 'mute' or integer 0-62")
+                return
+            level_str = "62"
+            expected_level = 62
+        elif isinstance(level, int):
+            if not (0 <= level <= 62):
+                self._logger.error(f"Invalid level {level}, must be 0-62 (62=mute)")
+                return
+            level_str = str(level)
+            expected_level = level
+        else:
+            self._logger.error(f"Invalid level type {type(level)}, must be int or 'mute'")
+            return
+        
+        self._logger.info(f"Volume request - Group: {group_id} to level: {level} (debounced)")
+        
+        # Cancel any pending debounce timer for this group
+        if group_id in self._group_volume_debounce_tasks:
+            old_level, old_task = self._group_volume_debounce_tasks[group_id]
+            if old_task and not old_task.done():
+                old_task.cancel()
+                self._logger.debug(f"Cancelled pending volume command for group {group_id} (was set to {old_level})")
+        
+        # Cancel any pending confirmation task for this group
+        if group_id in self._group_volume_confirm_task:
+            old_confirm_task = self._group_volume_confirm_task[group_id]
+            if old_confirm_task and not old_confirm_task.done():
+                old_confirm_task.cancel()
+                self._logger.debug(f"Cancelled pending volume confirmation for group {group_id}")
+        
+        # Create a new debounce task
+        debounce_task = self._loop.create_task(
+            self._debounce_group_volume_command(group_id, level_str, expected_level)
+        )
+        self._group_volume_debounce_tasks[group_id] = (level, debounce_task)
+
+    # ========== Debounce tasks ==========
+
+    async def _debounce_zone_source_command(self, zone_id: int, source_id: int):
+        """Wait for debounce delay, then send zone source command if not superseded."""
+        try:
+            await asyncio.sleep(self._volume_debounce_delay)
+            
+            # Check if this task was cancelled (superseded by newer request)
+            if zone_id in self._zone_source_debounce_tasks:
+                _, current_task = self._zone_source_debounce_tasks[zone_id]
+                if current_task != asyncio.current_task():
+                    self._logger.debug(f"Source command for zone {zone_id} to source {source_id} was superseded")
+                    return
+            
+            # Send the actual command
+            command = f"<Z{zone_id}.MU,S{source_id}/>\r"
+            self._logger.info(f"Queueing debounced source command: {command.encode()}")
+            self._enqueue_command(command)
+            
+            # Auto-confirm if enabled
+            if self._command_confirmation:
+                confirm_task = self._loop.create_task(self._confirm_zone_source(zone_id, source_id))
+                self._zone_source_confirm_task[zone_id] = confirm_task
+            
+            # Clean up debounce tracker
+            if zone_id in self._zone_source_debounce_tasks:
+                del self._zone_source_debounce_tasks[zone_id]
+        except asyncio.CancelledError:
+            self._logger.debug(f"Debounce task for zone {zone_id} source change was cancelled")
+            if zone_id in self._zone_source_debounce_tasks:
+                del self._zone_source_debounce_tasks[zone_id]
+
+    async def _debounce_zone_volume_command(self, zone_id: int, level_str: str, expected_level: int):
+        """Wait for debounce delay, then send zone volume command if not superseded."""
+        try:
+            await asyncio.sleep(self._volume_debounce_delay)
+            
+            # Check if this task was cancelled (superseded by newer request)
+            if zone_id in self._zone_volume_debounce_tasks:
+                _, current_task = self._zone_volume_debounce_tasks[zone_id]
+                if current_task != asyncio.current_task():
+                    self._logger.debug(f"Volume command for zone {zone_id} level {level_str} was superseded")
+                    return
+            
+            # Send the actual command
+            command = f"<Z{zone_id}.MU,L{level_str}/>\r"
+            self._logger.info(f"Queueing debounced volume command: {command.encode()}")
+            self._enqueue_command(command)
+            
+            # Auto-confirm if enabled
+            if self._command_confirmation:
+                confirm_task = self._loop.create_task(self._confirm_zone_volume(zone_id, expected_level))
+                self._zone_volume_confirm_task[zone_id] = confirm_task
+            
+            # Clean up debounce tracker
+            if zone_id in self._zone_volume_debounce_tasks:
+                del self._zone_volume_debounce_tasks[zone_id]
+        except asyncio.CancelledError:
+            self._logger.debug(f"Debounce task for zone {zone_id} was cancelled")
+            if zone_id in self._zone_volume_debounce_tasks:
+                del self._zone_volume_debounce_tasks[zone_id]
+
+    async def _debounce_group_source_command(self, group_id: int, source_id: int):
+        """Wait for debounce delay, then send group source command if not superseded."""
+        try:
+            await asyncio.sleep(self._volume_debounce_delay)
+            
+            # Check if this task was cancelled (superseded by newer request)
+            if group_id in self._group_source_debounce_tasks:
+                _, current_task = self._group_source_debounce_tasks[group_id]
+                if current_task != asyncio.current_task():
+                    self._logger.debug(f"Source command for group {group_id} to source {source_id} was superseded")
+                    return
+            
+            # Send the actual command
+            command = f"<G{group_id}.MU,S{source_id}/>\r"
+            self._logger.info(f"Queueing debounced source command: {command.encode()}")
+            self._enqueue_command(command)
+            
+            # Auto-confirm if enabled
+            if self._command_confirmation:
+                confirm_task = self._loop.create_task(self._confirm_group_source(group_id, source_id))
+                self._group_source_confirm_task[group_id] = confirm_task
+            
+            # Clean up debounce tracker
+            if group_id in self._group_source_debounce_tasks:
+                del self._group_source_debounce_tasks[group_id]
+        except asyncio.CancelledError:
+            self._logger.debug(f"Debounce task for group {group_id} source change was cancelled")
+            if group_id in self._group_source_debounce_tasks:
+                del self._group_source_debounce_tasks[group_id]
+
+    async def _debounce_group_volume_command(self, group_id: int, level_str: str, expected_level: int):
+        """Wait for debounce delay, then send group volume command if not superseded."""
+        try:
+            await asyncio.sleep(self._volume_debounce_delay)
+            
+            # Check if this task was cancelled (superseded by newer request)
+            if group_id in self._group_volume_debounce_tasks:
+                _, current_task = self._group_volume_debounce_tasks[group_id]
+                if current_task != asyncio.current_task():
+                    self._logger.debug(f"Volume command for group {group_id} level {level_str} was superseded")
+                    return
+            
+            # Send the actual command
+            command = f"<G{group_id}.MU,L{level_str}/>\r"
+            self._logger.info(f"Queueing debounced volume command: {command.encode()}")
+            self._enqueue_command(command)
+            
+            # Auto-confirm if enabled
+            if self._command_confirmation:
+                confirm_task = self._loop.create_task(self._confirm_group_volume(group_id, expected_level))
+                self._group_volume_confirm_task[group_id] = confirm_task
+            
+            # Clean up debounce tracker
+            if group_id in self._group_volume_debounce_tasks:
+                del self._group_volume_debounce_tasks[group_id]
+        except asyncio.CancelledError:
+            self._logger.debug(f"Debounce task for group {group_id} was cancelled")
+            if group_id in self._group_volume_debounce_tasks:
+                del self._group_volume_debounce_tasks[group_id]
+
+    # ========== Confirmation tasks ==========
+
+    async def _confirm_zone_source(self, zone_id: int, expected_source: int):
+        """Query source after setting to confirm."""
+        await asyncio.sleep(0.3)
+        self._logger.debug(f"Confirming source for zone {zone_id}, expected: {expected_source}")
+        
+        # Query the source
+        self._enqueue_command(f"<Z{zone_id}.MU,SQ/>\r", PRIORITY_READ)
+        
+        await asyncio.sleep(0.5)
+        
+        # Get the inflight command sequence_number for potential retry
+        matching_sequence_number = None
+        for sequence_number in sorted(self._inflight_commands.keys(), reverse=True):
+            _, message = self._inflight_commands[sequence_number]
+            if f"<Z{zone_id}.MU,S" in message:
+                matching_sequence_number = sequence_number
+                break
+        
+        # Check if the source matches expected
+        actual_source = self.get_zone_source(zone_id)
+        if actual_source is None:
+            self._logger.warning(f"Source confirmation: no response received for zone {zone_id}")
+            if self._retry_on_confirmation_timeout and matching_sequence_number is not None:
+                self._reenqueue_inflight_command(matching_sequence_number)
+        elif actual_source != expected_source:
+            self._logger.warning(f"Source mismatch: zone {zone_id} set to {expected_source}, got {actual_source}")
+        else:
+            self._logger.info(f"Source confirmation: zone {zone_id} set to source {actual_source} successfully")
+            self._clear_latest_inflight_command_by_pattern(f"<Z{zone_id}.MU,S")
+
+    async def _confirm_zone_volume(self, zone_id: int, expected_level: int):
+        """Query volume after setting to confirm."""
+        await asyncio.sleep(0.3)
+        self._logger.debug(f"Confirming volume for zone {zone_id}, expected: {expected_level}")
+        
+        # Query the volume level
+        self._enqueue_command(f"<Z{zone_id}.MU,LQ/>\r", PRIORITY_READ)
+        
+        await asyncio.sleep(0.5)
+        
+        # Get the inflight command sequence_number for potential retry
+        matching_sequence_number = None
+        for sequence_number in sorted(self._inflight_commands.keys(), reverse=True):
+            _, message = self._inflight_commands[sequence_number]
+            if f"<Z{zone_id}.MU,L" in message:
+                matching_sequence_number = sequence_number
+                break
+        
+        # Check if the volume matches expected
+        actual_level = self.get_zone_volume_level(zone_id)
+        if actual_level is None:
+            self._logger.warning(f"Volume confirmation: no response received for zone {zone_id}")
+            if self._retry_on_confirmation_timeout and matching_sequence_number is not None:
+                self._reenqueue_inflight_command(matching_sequence_number)
+            return
+
+        # Handle mute cases first
+        if actual_level == "mute":
+            if expected_level == 62:
+                self._logger.info(f"Volume confirmation: zone {zone_id} muted successfully")
+                self._clear_latest_inflight_command_by_pattern(f"<Z{zone_id}.MU,L")
+                return
+            # Retry once if we expected a number but read mute
+            self._logger.debug(
+                f"Volume mismatch (got mute), retrying query once: zone {zone_id} expected {expected_level}"
+            )
+            self._enqueue_command(f"<Z{zone_id}.MU,LQ/>\r", PRIORITY_READ)
+            await asyncio.sleep(0.4)
+            retry_level = self.get_zone_volume_level(zone_id)
+            if retry_level == expected_level:
+                self._logger.info(f"Volume confirmation: zone {zone_id} set to {retry_level} after retry")
+                self._clear_latest_inflight_command_by_pattern(f"<Z{zone_id}.MU,L")
+            else:
+                self._logger.warning(
+                    f"Volume mismatch: zone {zone_id} set to {expected_level}, got {retry_level if retry_level is not None else 'no response'}"
+                )
+            return
+
+        # Numeric levels
+        if isinstance(actual_level, int) and actual_level != expected_level:
+            # Retry once before giving up
+            self._logger.debug(
+                f"Volume mismatch (first read {actual_level}), retrying query once: zone {zone_id} expected {expected_level}"
+            )
+            self._enqueue_command(f"<Z{zone_id}.MU,LQ/>\r", PRIORITY_READ)
+            await asyncio.sleep(0.4)
+            retry_level = self.get_zone_volume_level(zone_id)
+            if retry_level == expected_level:
+                self._logger.info(f"Volume confirmation: zone {zone_id} set to {retry_level} after retry")
+                self._clear_latest_inflight_command_by_pattern(f"<Z{zone_id}.MU,L")
+            else:
+                self._logger.warning(
+                    f"Volume mismatch: zone {zone_id} set to {expected_level}, got {retry_level if retry_level is not None else actual_level}"
+                )
+        else:
+            self._logger.info(f"Volume confirmation: zone {zone_id} set to {actual_level} successfully")
+            self._clear_latest_inflight_command_by_pattern(f"<Z{zone_id}.MU,L")
+
+    async def _confirm_group_source(self, group_id: int, expected_source: int):
+        """Query group source after setting to confirm."""
+        await asyncio.sleep(0.3)
+        self._logger.debug(f"Confirming source for group {group_id}, expected: {expected_source}")
+        
+        # Query the source
+        self._enqueue_command(f"<G{group_id}.MU,SQ/>\r", PRIORITY_READ)
+        
+        await asyncio.sleep(0.5)
+        
+        # Get the inflight command sequence_number for potential retry
+        matching_sequence_number = None
+        for sequence_number in sorted(self._inflight_commands.keys(), reverse=True):
+            _, message = self._inflight_commands[sequence_number]
+            if f"<G{group_id}.MU,S" in message:
+                matching_sequence_number = sequence_number
+                break
+        
+        # Check if the source matches expected
+        actual_source = self.get_group_source(group_id)
+        if actual_source is None:
+            self._logger.warning(f"Source confirmation: no response received for group {group_id}")
+            if self._retry_on_confirmation_timeout and matching_sequence_number is not None:
+                self._reenqueue_inflight_command(matching_sequence_number)
+        elif actual_source != expected_source:
+            self._logger.warning(f"Source mismatch: group {group_id} set to {expected_source}, got {actual_source}")
+        else:
+            self._logger.info(f"Source confirmation: group {group_id} set to source {actual_source} successfully")
+            self._clear_latest_inflight_command_by_pattern(f"<G{group_id}.MU,S")
+
+    async def _confirm_group_volume(self, group_id: int, expected_level: int):
+        """Query group volume after setting to confirm."""
+        await asyncio.sleep(0.3)
+        self._logger.debug(f"Confirming volume for group {group_id}, expected: {expected_level}")
+        
+        # Query the volume level
+        self._enqueue_command(f"<G{group_id}.MU,LQ/>\r", PRIORITY_READ)
+        
+        await asyncio.sleep(0.5)
+        
+        # Get the inflight command sequence_number for potential retry
+        matching_sequence_number = None
+        for sequence_number in sorted(self._inflight_commands.keys(), reverse=True):
+            _, message = self._inflight_commands[sequence_number]
+            if f"<G{group_id}.MU,L" in message:
+                matching_sequence_number = sequence_number
+                break
+        
+        # Check if the volume matches expected
+        actual_level = self.get_group_volume_level(group_id)
+        if actual_level is None:
+            self._logger.warning(f"Volume confirmation: no response received for group {group_id}")
+            if self._retry_on_confirmation_timeout and matching_sequence_number is not None:
+                self._reenqueue_inflight_command(matching_sequence_number)
+            return
+
+        # Handle mute cases first
+        if actual_level == "mute":
+            if expected_level == 62:
+                self._logger.info(f"Volume confirmation: group {group_id} muted successfully")
+                self._clear_latest_inflight_command_by_pattern(f"<G{group_id}.MU,L")
+                return
+            # Retry once if we expected a number but read mute
+            self._logger.debug(
+                f"Volume mismatch (got mute), retrying query once: group {group_id} expected {expected_level}"
+            )
+            self._enqueue_command(f"<G{group_id}.MU,LQ/>\r", PRIORITY_READ)
+            await asyncio.sleep(0.4)
+            retry_level = self.get_group_volume_level(group_id)
+            if retry_level == expected_level:
+                self._logger.info(f"Volume confirmation: group {group_id} set to {retry_level} after retry")
+                self._clear_latest_inflight_command_by_pattern(f"<G{group_id}.MU,L")
+            else:
+                self._logger.warning(
+                    f"Volume mismatch: group {group_id} set to {expected_level}, got {retry_level if retry_level is not None else 'no response'}"
+                )
+            return
+
+        # Numeric levels
+        if isinstance(actual_level, int) and actual_level != expected_level:
+            # Retry once before giving up
+            self._logger.debug(
+                f"Volume mismatch (first read {actual_level}), retrying query once: group {group_id} expected {expected_level}"
+            )
+            self._enqueue_command(f"<G{group_id}.MU,LQ/>\r", PRIORITY_READ)
+            await asyncio.sleep(0.4)
+            retry_level = self.get_group_volume_level(group_id)
+            if retry_level == expected_level:
+                self._logger.info(f"Volume confirmation: group {group_id} set to {retry_level} after retry")
+                self._clear_latest_inflight_command_by_pattern(f"<G{group_id}.MU,L")
+            else:
+                self._logger.warning(
+                    f"Volume mismatch: group {group_id} set to {expected_level}, got {retry_level if retry_level is not None else actual_level}"
+                )
+        else:
+            self._logger.info(f"Volume confirmation: group {group_id} set to {actual_level} successfully")
+            self._clear_latest_inflight_command_by_pattern(f"<G{group_id}.MU,L")
+
+    # ========== Queue management ==========
+
+    def _enqueue_command(self, message, priority: int = PRIORITY_WRITE):
+        """Queue a command to be sent via the persistent connection."""
+        # Deduplication: Only queue if not already present
+        msg_key = message.strip()
+        if msg_key in self._queued_commands_set:
+            self._logger.info(f"QUEUE: Duplicate command not queued: {msg_key}")
+            return
+        self._queued_commands_set.add(msg_key)
+        # Safety: make sure the command worker is alive
+        if self._command_worker_task is None or self._command_worker_task.done():
+            self._logger.warning("Command worker was not running; restarting it")
+            self._command_worker_task = self._loop.create_task(self._command_worker())
+        try:
+            self._command_sequence_number += 1
+            self._logger.info(f"QUEUE: Adding command #{self._command_sequence_number} (priority={priority}): {msg_key}")
+            self._command_queue.put_nowait((priority, self._command_sequence_number, (message, None)))
+            self._logger.info(f"QUEUE: Command #{self._command_sequence_number} queued successfully, queue size ~= {self._command_queue.qsize()}")
+        except asyncio.QueueFull:
+            self._logger.error("Command queue is full, dropping command")
+
+    async def _command_worker(self):
+        """Worker task that processes all outgoing commands from the priority queue."""
+        while True:
+            try:
+                # Priority queue returns (priority, sequence_number, (message, response_validator))
+                priority, sequence_number, (message, response_validator) = await self._command_queue.get()
+                msg_key = message.strip()
+                self._logger.info(f"[WORKER] Processing command #{sequence_number} (priority={priority}): {msg_key}")
+                try:
+                    # Track write commands for recovery on reconnection BEFORE sending
+                    if priority == PRIORITY_WRITE:
+                        self._inflight_commands[sequence_number] = (priority, message)
+                        self._logger.info(f"[WORKER] Tracking inflight command: Command #{sequence_number}")
+                        # Remove any older inflight commands for the same zone/group to avoid resending superseded commands
+                        self._debounce_inflight_commands(sequence_number, message)
+                    
+                    # Enforce minimum delay between commands to avoid MCU serial port clashes
+                    time_since_last_send = time.time() - self._last_send_timestamp
+                    if time_since_last_send < self._min_send_delay_seconds:
+                        wait_time = self._min_send_delay_seconds - time_since_last_send
+                        self._logger.debug(f"Waiting {wait_time:.2f}s before sending command")
+                        await asyncio.sleep(wait_time)
+                    
+                    if self._connected and self._protocol._transport:
+                        self._logger.info(f"SEND: Command #{sequence_number} (priority={priority}): {message.encode()}")
+                        self._protocol.write(message)
+                        self._logger.info(f"SEND: Command #{sequence_number} written to transport successfully")
+                    else:
+                        self._logger.error(f"SEND FAILED: Command #{sequence_number} - not connected (connected={self._connected})")
+                        # Connection is definitely down - trigger immediate reconnection
+                        if self._connected:
+                            self._handle_connection_broken()
+                    
+                    self._last_send_timestamp = time.time()
+                except Exception as e:
+                    self._logger.error(f"Error sending command: {e}", exc_info=True)
+                finally:
+                    # Remove from deduplication set so it can be re-queued in the future
+                    if msg_key in self._queued_commands_set:
+                        self._queued_commands_set.remove(msg_key)
+                    self._command_queue.task_done()
+            except asyncio.CancelledError:
+                self._logger.debug("Command worker cancelled")
+                break
+            except Exception as e:
+                self._logger.error(f"Unexpected error in command worker loop: {e}", exc_info=True)
+                break
+
+    # ========== Heartbeat ==========
+
+    async def _heartbeat(self):
+        """Periodically query zone and group status to sync with physical panel changes."""
+        while True:
+            await asyncio.sleep(self._heartbeat_time)
+            self._logger.debug(f"heartbeat - polling status for {self._zone_count} zones and {self._group_count} groups")
+            
+            # Query source and volume for all zones
+            for zone_id in range(1, self._zone_count + 1):
+                # Query source with deduplication
+                zone_source_query = f"<Z{zone_id}.MU,SQ/>\r"
+                if zone_source_query not in self._pending_heartbeat_queries:
+                    self._command_sequence_number += 1
+                    self._pending_heartbeat_queries.add(zone_source_query)
+                    await self._command_queue.put((PRIORITY_READ, self._command_sequence_number, (zone_source_query, None)))
+
+                # Query volume level with deduplication
+                zone_volume_query = f"<Z{zone_id}.MU,LQ/>\r"
+                if zone_volume_query not in self._pending_heartbeat_queries:
+                    self._command_sequence_number += 1
+                    self._pending_heartbeat_queries.add(zone_volume_query)
+                    await self._command_queue.put((PRIORITY_READ, self._command_sequence_number, (zone_volume_query, None)))
+                            
+            # Query source and volume for all groups
+            for group_id in range(1, self._group_count + 1):                
+                # Query group source with deduplication
+                group_source_query = f"<G{group_id}.MU,SQ/>\r"
+                if group_source_query not in self._pending_heartbeat_queries:
+                    self._command_sequence_number += 1
+                    self._pending_heartbeat_queries.add(group_source_query)
+                    await self._command_queue.put((PRIORITY_READ, self._command_sequence_number, (group_source_query, None)))
+
+                # Query group volume level with deduplication
+                group_volume_query = f"<G{group_id}.MU,LQ/>\r"
+                if group_volume_query not in self._pending_heartbeat_queries:
+                    self._command_sequence_number += 1
+                    self._pending_heartbeat_queries.add(group_volume_query)
+                    await self._command_queue.put((PRIORITY_READ, self._command_sequence_number, (group_volume_query, None)))
+
+    # ========== Connection management ==========
+
+    async def _connection_watchdog(self):
+        """Monitor connection health and trigger reconnection if connection dies silently."""
+        idle_timeout_seconds = 30.0
+        check_interval_seconds = 5.0
+        
+        while self._reconnect:
+            try:
+                await asyncio.sleep(check_interval_seconds)
+                
+                if self._connected:
+                    elapsed_seconds_since_data_last_received = time.time() - self._last_receive_timestamp
+                    
+                    if elapsed_seconds_since_data_last_received > idle_timeout_seconds:
+                        self._logger.error(
+                            f"[WATCHDOG FALLBACK] Connection appears dead: no data received for {elapsed_seconds_since_data_last_received:.1f}s, reconnecting..."
+                        )
+                        self._connected = False
+                        if self._protocol._transport:
+                            self._protocol._transport.close()
+                        # Schedule reconnection
+                        await self._wait_to_reconnect()
+                        return
+            except asyncio.CancelledError:
+                self._logger.debug("Connection watchdog cancelled")
+                break
+            except Exception as e:
+                self._logger.error(f"Error in connection watchdog: {e}")
+
+    async def _wait_to_reconnect(self):
+        """Attempt to reconnect after connection loss."""
+        while not self._connected and self._reconnect:
+            await asyncio.sleep(self._reconnect_time)
+            try:
+                await self.async_connect()
+            except Exception as e:
+                self._logger.warning(f"Reconnect attempt failed: {e}")
+
+    def _handle_connection_broken(self):
+        """Handle connection loss - called either by protocol callback or by send failure detection."""
+        self._connected = False
+        self._connection_lost_timestamp = time.time()
+        
+        if self._heartbeat_task is not None:
+            self._heartbeat_task.cancel()
+        if self._command_worker_task is not None:
+            self._command_worker_task.cancel()
+        
+        # Cancel confirmation tasks
+        for task in self._zone_source_confirm_task.values():
+            if task and not task.done():
+                task.cancel()
+        for task in self._zone_volume_confirm_task.values():
+            if task and not task.done():
+                task.cancel()
+        for task in self._group_source_confirm_task.values():
+            if task and not task.done():
+                task.cancel()
+        for task in self._group_volume_confirm_task.values():
+            if task and not task.done():
+                task.cancel()
+        
+        if hasattr(self, '_connection_watchdog_task') and self._connection_watchdog_task is not None:
+            self._connection_watchdog_task.cancel()
+        
+        disconnected_message = f"Disconnected from {self.hostname}"
+        if self._reconnect:
+            disconnected_message = disconnected_message + f", will try to reconnect in {self._reconnect_time} seconds"
+            self._logger.error(disconnected_message)
+        else:
+            disconnected_message = disconnected_message + ", not reconnecting"
+            self._logger.info(disconnected_message)
+        
+        if self._reconnect:
+            self._loop.create_task(self._wait_to_reconnect())
+
+    # ========== Inflight command management ==========
+
+    def _clear_latest_inflight_command_by_pattern(self, pattern: str):
+        """Clear the most recent inflight command matching a command pattern."""
+        for sequence_number in sorted(self._inflight_commands.keys(), reverse=True):
+            _, message = self._inflight_commands[sequence_number]
+            if pattern in message:
+                self._logger.debug(f"Clearing confirmed inflight send: Command #{sequence_number} matching {pattern}")
+                del self._inflight_commands[sequence_number]
+                return
+
+    def _reenqueue_inflight_command(self, sequence_number: int) -> bool:
+        """Attempt to retry an inflight command that failed confirmation."""
+        if sequence_number not in self._inflight_commands:
+            self._logger.warning(f"Cannot reenqueue command: #{sequence_number} not in inflight_commands")
+            return False
+        
+        if not self._connected or self._protocol._transport is None:
+            self._logger.debug(f"Skip reenqueue for command #{sequence_number}: transport unavailable (offline)")
+            return False
+        
+        reenqueue_count = self._inflight_command_reenqueue_counts.get(sequence_number, 0)
+        if reenqueue_count >= self._max_retries:
+            self._logger.error(f"Max retries ({self._max_retries}) exceeded for command #{sequence_number}, giving up")
+            return False
+        
+        priority, message = self._inflight_commands[sequence_number]
+        self._logger.warning(f"Reenqueuing failed command #{sequence_number} (attempt {reenqueue_count + 1}/{self._max_retries}): {message.strip()}")
+        self._inflight_command_reenqueue_counts[sequence_number] = reenqueue_count + 1
+        
+        try:
+            self._command_queue.put_nowait((priority, sequence_number, (message, None)))
+            return True
+        except asyncio.QueueFull:
+            self._logger.error(f"Queue full, could not retry command #{sequence_number}")
+            return False
+
+    def _debounce_inflight_commands(self, sequence_number: int, message: str):
+        """Remove older inflight commands for the same zone/group AND command type."""
+        # Extract zone/group and command type
+        zone_vol_match = re.search(r'<Z(\d+)\.MU,L', message)
+        zone_src_match = re.search(r'<Z(\d+)\.MU,S', message)
+        group_vol_match = re.search(r'<G(\d+)\.MU,L', message)
+        group_src_match = re.search(r'<G(\d+)\.MU,S', message)
+        
+        if zone_src_match:
+            zone_id = zone_src_match.group(1)
+            pattern = f"<Z{zone_id}.MU,S"
+        elif zone_vol_match:
+            zone_id = zone_vol_match.group(1)
+            pattern = f"<Z{zone_id}.MU,L"
+        elif group_src_match:
+            group_id = group_src_match.group(1)
+            pattern = f"<G{group_id}.MU,S"
+        elif group_vol_match:
+            group_id = group_vol_match.group(1)
+            pattern = f"<G{group_id}.MU,L"
+        else:
+            return
+        
+        # Remove all older inflight commands matching the EXACT zone/group AND command type
+        to_remove = []
+        for old_sequence_number in sorted(self._inflight_commands.keys()):
+            if old_sequence_number >= sequence_number:
+                continue
+            _, old_message = self._inflight_commands[old_sequence_number]
+            if pattern in old_message:
+                to_remove.append(old_sequence_number)
+                self._logger.debug(f"Removing superseded inflight command: #{old_sequence_number} (newer #{sequence_number} replaces it for {pattern})")
+        
+        for old_sequence_number in to_remove:
+            del self._inflight_commands[old_sequence_number]
+
+    # ========== Query commands ==========
+
+    def enqueue_zone_source_query_commands(self):
+        self._logger.info(f"Sending status query messages for all zones")
+        for zone_id in range(1, self._zone_count + 1):
+            self._enqueue_command(f"<Z{zone_id}.MU,SQ/>\r", PRIORITY_READ)
+
+    def enqueue_zone_label_query_commands(self):
+        self._logger.info(f"Querying zone labels")
+        for zone_id in range(1, self._zone_count + 1):
+            self._enqueue_command(f"<Z{zone_id},LQ/>\r", PRIORITY_READ)
+
+    def enqueue_source_label_query_commands(self):
+        self._logger.info(f"Querying source labels")
+        for source_id in range(1, self._source_count + 1):
+            self._enqueue_command(f"<L{source_id},LQ/>\r", PRIORITY_READ)
+
+    def enqueue_zone_volume_level_query_commands(self):
+        self._logger.info(f"Querying zone volume levels")
+        for zone_id in range(1, self._zone_count + 1):
+            self._enqueue_command(f"<Z{zone_id}.MU,LQ/>\r", PRIORITY_READ)
+
+    def enqueue_zone_line_input_enable_query_commands(self):
+        """Query which line inputs are enabled for all zones (1-8)."""
+        self._logger.info("Querying line input enables for all zones")
+        for zone_id in range(1, self._zone_count + 1):
+            for line_id in range(1, self._source_count + 1):
+                self._enqueue_command(f"<Z{zone_id}.L{line_id},Q/>\r", PRIORITY_READ)
+
+    def enqueue_group_line_input_enable_query_commands(self):
+        """Query which line inputs are enabled for all groups (1-4)."""
+        self._logger.info("Querying line input enables for all groups")
+        for group_id in range(1, self._group_count + 1):
+            for line_id in range(1, self._source_count + 1):
+                self._enqueue_command(f"<G{group_id}.L{line_id},Q/>\r", PRIORITY_READ)
+
+    def enqueue_group_status_query_commands(self):
+        """Query group status for all groups."""
+        self._logger.info("Querying group status for all groups")
+        for group_id in range(1, self._group_count + 1):
+            self._enqueue_command(f"<G{group_id},Q/>\r", PRIORITY_READ)
+
+    def enqueue_group_label_query_commands(self):
+        """Query group labels for all groups."""
+        self._logger.info("Querying group labels for all groups")
+        for group_id in range(1, self._group_count + 1):
+            self._enqueue_command(f"<G{group_id},LQ/>\r", PRIORITY_READ)
+
+    def enqueue_group_source_query_commands(self):
+        """Query group source for all groups."""
+        self._logger.info("Querying group source for all groups")
+        for group_id in range(1, self._group_count + 1):
+            self._enqueue_command(f"<G{group_id}.MU,SQ/>\r", PRIORITY_READ)
+
+    def enqueue_group_volume_level_query_commands(self):
+        """Query group volume level for all groups."""
+        self._logger.info("Querying group volume levels for all groups")
+        for group_id in range(1, self._group_count + 1):
+            self._enqueue_command(f"<G{group_id}.MU,LQ/>\r", PRIORITY_READ)
+
+    # ========== Helper methods (for backward compatibility with old API) ==========
 
     def query_status(self):
         """Query all relevant mixer state from the device."""
@@ -323,35 +1312,28 @@ class DCM1Mixer:
 
     def query_source_labels(self):
         """Query all source labels from the device."""
-        self.protocol.enqueue_source_label_query_commands()
+        self.enqueue_source_label_query_commands()
 
     def query_all_zones(self):
         """Query all zone labels, sources, line input enables, and volume levels from the device."""
-        self.protocol.enqueue_zone_label_query_commands()
-        self.protocol.enqueue_zone_source_query_commands()
-        self.protocol.enqueue_zone_line_input_enable_query_commands()
-        self.protocol.enqueue_zone_volume_level_query_commands()
+        self.enqueue_zone_label_query_commands()
+        self.enqueue_zone_source_query_commands()
+        self.enqueue_zone_line_input_enable_query_commands()
+        self.enqueue_zone_volume_level_query_commands()
 
     def query_all_groups(self):
         """Query all group statuses, labels, sources, line input enables, and volume levels from the device."""
-        self.protocol.enqueue_group_status_query_commands()
-        self.protocol.enqueue_group_label_query_commands()
-        self.protocol.enqueue_group_line_input_enable_query_commands()        
-        self.protocol.enqueue_group_source_query_commands()
-        self.protocol.enqueue_group_volume_level_query_commands()
+        self.enqueue_group_status_query_commands()
+        self.enqueue_group_label_query_commands()
+        self.enqueue_group_line_input_enable_query_commands()        
+        self.enqueue_group_source_query_commands()
+        self.enqueue_group_volume_level_query_commands()
 
     async def wait_for_source_labels(self, timeout: float = 6.0):
-        """Wait for all source labels to be received from the device.
-        
-        Args:
-            timeout: Maximum time to wait in seconds
-        Returns:
-            True if all source labels received, False if timeout
-        """
-        import asyncio
-        start_time = asyncio.get_event_loop().time()
+        """Wait for all source labels to be received from the device."""
+        start_time = self._loop.time()
         expected_source_ids = set(self.sources_by_id.keys())
-        while asyncio.get_event_loop().time() - start_time < timeout:
+        while self._loop.time() - start_time < timeout:
             if self._sources_labels_received >= expected_source_ids:
                 return True
             await asyncio.sleep(0.1)
@@ -361,17 +1343,10 @@ class DCM1Mixer:
         return False
 
     async def wait_for_zone_data(self, timeout: float = 10.0):
-        """Wait for all zone data (labels, line inputs, volume, and sources) to be received from the device.
-        
-        Args:
-            timeout: Maximum time to wait in seconds
-        Returns:
-            True if all data received, False if timeout
-        """
-        import asyncio
-        start_time = asyncio.get_event_loop().time()
+        """Wait for all zone data (labels, line inputs, volume, and sources) to be received."""
+        start_time = self._loop.time()
         expected_zone_ids = set(self.zones_by_id.keys())
-        while asyncio.get_event_loop().time() - start_time < timeout:
+        while self._loop.time() - start_time < timeout:
             if (self._zones_labels_received >= expected_zone_ids and
                 self._zones_line_inputs_received >= expected_zone_ids and
                 self._zones_volume_received >= expected_zone_ids and
@@ -394,18 +1369,10 @@ class DCM1Mixer:
         return False
 
     async def wait_for_group_data(self, timeout: float = 10.0):
-        """Wait for all group data to be received from the device, including sources.
-        
-        Args:
-            timeout: Maximum time to wait in seconds
-        Returns:
-            True if all data received, False if timeout
-        """
-        import asyncio
-        start_time = asyncio.get_event_loop().time()
+        """Wait for all group data to be received from the device, including sources."""
+        start_time = self._loop.time()
         expected_group_ids = set(self.groups_by_id.keys())
-        while asyncio.get_event_loop().time() - start_time < timeout:
-            # Check if we've received labels, status, volume, line inputs, and sources for all groups
+        while self._loop.time() - start_time < timeout:
             if (self._groups_labels_received >= expected_group_ids and 
                 self._groups_status_received >= expected_group_ids and
                 self._groups_volume_received >= expected_group_ids and
