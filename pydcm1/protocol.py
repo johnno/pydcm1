@@ -12,6 +12,7 @@ All that logic has been moved to DCM1Mixer."""
 import asyncio
 import logging
 import re
+from enum import Enum
 from typing import Optional
 
 from pydcm1.listener import MixerResponseListener
@@ -55,6 +56,11 @@ GROUP_SOURCE_RESPONSE = re.compile(r"<g(\d+)\.mu,s=(\d+)/>", re.IGNORECASE)
 
 # Group volume level response: <g1.mu,l=20/> or <g1.mu,l=mute/>
 GROUP_VOLUME_LEVEL_RESPONSE = re.compile(r"<g(\d+)\.mu,l=([^/]+)/>", re.IGNORECASE)
+
+
+class OutputType(str, Enum):
+    ZONE = "Z"
+    GROUP = "G"
 
 
 class MixerProtocol(asyncio.Protocol):
@@ -141,6 +147,46 @@ class MixerProtocol(asyncio.Protocol):
             self._transport.write(message.encode())
         else:
             self._logger.error("Cannot write: transport not connected")
+
+    @staticmethod
+    def command_source_pattern(output_type: OutputType, output_id: int) -> str:
+        return f"<{output_type.value}{output_id}.MU,S"
+
+    @staticmethod
+    def command_volume_pattern(output_type: OutputType, output_id: int) -> str:
+        return f"<{output_type.value}{output_id}.MU,L"
+
+    @staticmethod
+    def command_set_source(output_type: OutputType, output_id: int, source_id: int) -> str:
+        return f"<{output_type.value}{output_id}.MU,S{source_id}/>\r"
+
+    @staticmethod
+    def command_set_volume(output_type: OutputType, output_id: int, level_str: str) -> str:
+        return f"<{output_type.value}{output_id}.MU,L{level_str}/>\r"
+
+    @staticmethod
+    def command_query_source(output_type: OutputType, output_id: int) -> str:
+        return f"<{output_type.value}{output_id}.MU,SQ/>\r"
+
+    @staticmethod
+    def command_query_volume(output_type: OutputType, output_id: int) -> str:
+        return f"<{output_type.value}{output_id}.MU,LQ/>\r"
+
+    @staticmethod
+    def command_query_line_input(output_type: OutputType, output_id: int, line_id: int) -> str:
+        return f"<{output_type.value}{output_id}.L{line_id},Q/>\r"
+
+    @staticmethod
+    def command_query_label(output_type: OutputType, output_id: int) -> str:
+        return f"<{output_type.value}{output_id},LQ/>\r"
+
+    @staticmethod
+    def command_query_group_status(group_id: int) -> str:
+        return f"<G{group_id},Q/>\r"
+
+    @staticmethod
+    def command_query_source_label(source_id: int) -> str:
+        return f"<L{source_id},LQ/>\r"
 
     def _process_received_message(self, message: str):
         """Parse received message and fire appropriate listener callback.

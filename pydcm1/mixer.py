@@ -21,7 +21,7 @@ from asyncio import PriorityQueue, Task
 from typing import Any, Optional
 
 from pydcm1.listener import MultiplexingListener, MixerResponseListener
-from pydcm1.protocol import MixerProtocol
+from pydcm1.protocol import MixerProtocol, OutputType
 
 # Command priority levels (lower number = higher priority)
 # Design: WRITE commands have higher priority than READ queries
@@ -69,33 +69,6 @@ class Output(ABC):
         self.source_received: bool = False
         self.volume_received: bool = False
 
-    @property
-    @abstractmethod
-    def _command_prefix(self) -> str:
-        """Prefix for command addressing ("Z" for zones, "G" for groups)."""
-
-    @property
-    @abstractmethod
-    def _type_name(self) -> str:
-        """Human-readable type name used in log messages."""
-
-    def _source_pattern(self) -> str:
-        return f"<{self._command_prefix}{self.id}.MU,S"
-
-    def _volume_pattern(self) -> str:
-        return f"<{self._command_prefix}{self.id}.MU,L"
-
-    def _source_command(self, source_id: int) -> str:
-        return f"<{self._command_prefix}{self.id}.MU,S{source_id}/>\r"
-
-    def _source_query_command(self) -> str:
-        return f"<{self._command_prefix}{self.id}.MU,SQ/>\r"
-
-    def _volume_command(self, level_str: str) -> str:
-        return f"<{self._command_prefix}{self.id}.MU,L{level_str}/>\r"
-
-    def _volume_query_command(self) -> str:
-        return f"<{self._command_prefix}{self.id}.MU,LQ/>\r"
 
     def set_source(self, source_id: int):
         """Set source for this output with validation."""
@@ -133,7 +106,7 @@ class Output(ABC):
             await asyncio.sleep(self.mixer._volume_debounce_delay)
             if self.source_debounce_task != asyncio.current_task():
                 return
-            command = self._source_command(source_id)
+            command = MixerProtocol.command_set_source(self._output_type, self.id, source_id)
             self.mixer._enqueue_command(command)
             if self.mixer._command_confirmation:
                 self.source_confirm_task = self.mixer._loop.create_task(
@@ -146,18 +119,23 @@ class Output(ABC):
     async def _confirm_source(self, expected_source: int):
         """Confirm source was set correctly."""
         await asyncio.sleep(0.3)
-        self.mixer._enqueue_command(self._source_query_command(), PRIORITY_READ)
+        self.mixer._enqueue_command(
+            MixerProtocol.command_query_source(self._output_type, self.id),
+            PRIORITY_READ,
+        )
         await asyncio.sleep(0.5)
 
         if self.source != expected_source:
             # Find and retry inflight command
             for seq_num in sorted(self.mixer._inflight_commands.keys(), reverse=True):
                 _, msg = self.mixer._inflight_commands[seq_num]
-                if self._source_pattern() in msg:
+                if MixerProtocol.command_source_pattern(self._output_type, self.id) in msg:
                     self.mixer._reenqueue_inflight_command(seq_num)
                     break
         else:
-            self.mixer._clear_latest_inflight_command_by_pattern(self._source_pattern())
+            self.mixer._clear_latest_inflight_command_by_pattern(
+                MixerProtocol.command_source_pattern(self._output_type, self.id)
+            )
 
     def set_volume(self, level):
         """Set volume for this output with validation."""
@@ -207,7 +185,7 @@ class Output(ABC):
             await asyncio.sleep(self.mixer._volume_debounce_delay)
             if self.volume_debounce_task != asyncio.current_task():
                 return
-            command = self._volume_command(level_str)
+            command = MixerProtocol.command_set_volume(self._output_type, self.id, level_str)
             self.mixer._enqueue_command(command)
             if self.mixer._command_confirmation:
                 self.volume_confirm_task = self.mixer._loop.create_task(
@@ -220,46 +198,47 @@ class Output(ABC):
     async def _confirm_volume(self, expected_level: int):
         """Confirm volume was set correctly."""
         await asyncio.sleep(0.3)
-        self.mixer._enqueue_command(self._volume_query_command(), PRIORITY_READ)
+        self.mixer._enqueue_command(
+            MixerProtocol.command_query_volume(self._output_type, self.id),
+            PRIORITY_READ,
+        )
         await asyncio.sleep(0.5)
 
         if self.volume != expected_level and self.volume is not None:
             # Retry query once
-            self.mixer._enqueue_command(self._volume_query_command(), PRIORITY_READ)
+            self.mixer._enqueue_command(
+                MixerProtocol.command_query_volume(self._output_type, self.id),
+                PRIORITY_READ,
+            )
             await asyncio.sleep(0.4)
 
         if self.volume == expected_level:
-            self.mixer._clear_latest_inflight_command_by_pattern(self._volume_pattern())
+            self.mixer._clear_latest_inflight_command_by_pattern(
+                MixerProtocol.command_volume_pattern(self._output_type, self.id)
+            )
         else:
             # Find and retry inflight command
             for seq_num in sorted(self.mixer._inflight_commands.keys(), reverse=True):
                 _, msg = self.mixer._inflight_commands[seq_num]
-                if self._volume_pattern() in msg:
+                if MixerProtocol.command_volume_pattern(self._output_type, self.id) in msg:
                     self.mixer._reenqueue_inflight_command(seq_num)
                     break
 
 
 class Zone(Output):
     """Represents a zone in the DCM1 mixer with state and control tracking."""
-    _prefix = "Z"
-    _label = "Zone"
+    _output_type = OutputType.ZONE
+    _type_name = "Zone"
 
     def __init__(self, zone_id: int, name: str, mixer: 'DCM1Mixer' = None):
         super().__init__(zone_id, name, mixer=mixer)
 
-    @property
-    def _command_prefix(self) -> str:
-        return self._prefix
-
-    @property
-    def _type_name(self) -> str:
-        return self._label
 
 
 class Group(Output):
     """Represents a group in the DCM1 mixer with state and control tracking."""
-    _prefix = "G"
-    _label = "Group"
+    _output_type = OutputType.GROUP
+    _type_name = "Group"
 
     def __init__(
         self,
@@ -275,14 +254,6 @@ class Group(Output):
 
         # Tracking: Which attributes have been received from device
         self.status_received: bool = False
-
-    @property
-    def _command_prefix(self) -> str:
-        return self._prefix
-
-    @property
-    def _type_name(self) -> str:
-        return self._label
 
 
 class MixerListener(MixerResponseListener):
@@ -427,7 +398,7 @@ class DCM1Mixer:
             reconnect_time: Seconds to wait between reconnection attempts
             command_confirmation: Whether to auto-confirm commands
         """
-        self.hostname: str = hostname
+        self._hostname: str = hostname
         self._port = port
         self._enable_heartbeat = enable_heartbeat
         self._heartbeat_time = heartbeat_time
@@ -736,7 +707,7 @@ class DCM1Mixer:
         
         # Create connection to device
         transport, protocol = await self._loop.create_connection(
-            lambda: self._protocol, host=self.hostname, port=self._port
+            lambda: self._protocol, host=self._hostname, port=self._port
         )
 
     def close(self):
@@ -872,14 +843,14 @@ class DCM1Mixer:
             # Query source and volume for all zones
             for zone_id in range(1, self._zone_count + 1):
                 # Query source with deduplication
-                zone_source_query = f"<Z{zone_id}.MU,SQ/>\r"
+                zone_source_query = MixerProtocol.command_query_source(OutputType.ZONE, zone_id)
                 if zone_source_query not in self._pending_heartbeat_queries:
                     self._command_sequence_number += 1
                     self._pending_heartbeat_queries.add(zone_source_query)
                     await self._command_queue.put((PRIORITY_READ, self._command_sequence_number, (zone_source_query, None)))
 
                 # Query volume level with deduplication
-                zone_volume_query = f"<Z{zone_id}.MU,LQ/>\r"
+                zone_volume_query = MixerProtocol.command_query_volume(OutputType.ZONE, zone_id)
                 if zone_volume_query not in self._pending_heartbeat_queries:
                     self._command_sequence_number += 1
                     self._pending_heartbeat_queries.add(zone_volume_query)
@@ -888,14 +859,14 @@ class DCM1Mixer:
             # Query source and volume for all groups
             for group_id in range(1, self._group_count + 1):                
                 # Query group source with deduplication
-                group_source_query = f"<G{group_id}.MU,SQ/>\r"
+                group_source_query = MixerProtocol.command_query_source(OutputType.GROUP, group_id)
                 if group_source_query not in self._pending_heartbeat_queries:
                     self._command_sequence_number += 1
                     self._pending_heartbeat_queries.add(group_source_query)
                     await self._command_queue.put((PRIORITY_READ, self._command_sequence_number, (group_source_query, None)))
 
                 # Query group volume level with deduplication
-                group_volume_query = f"<G{group_id}.MU,LQ/>\r"
+                group_volume_query = MixerProtocol.command_query_volume(OutputType.GROUP, group_id)
                 if group_volume_query not in self._pending_heartbeat_queries:
                     self._command_sequence_number += 1
                     self._pending_heartbeat_queries.add(group_volume_query)
@@ -966,7 +937,7 @@ class DCM1Mixer:
         if hasattr(self, '_connection_watchdog_task') and self._connection_watchdog_task is not None:
             self._connection_watchdog_task.cancel()
         
-        disconnected_message = f"Disconnected from {self.hostname}"
+        disconnected_message = f"Disconnected from {self._hostname}"
         if self._reconnect:
             disconnected_message = disconnected_message + f", will try to reconnect in {self._reconnect_time} seconds"
             self._logger.error(disconnected_message)
@@ -1024,16 +995,16 @@ class DCM1Mixer:
         
         if zone_src_match:
             zone_id = zone_src_match.group(1)
-            pattern = f"<Z{zone_id}.MU,S"
+            pattern = MixerProtocol.command_source_pattern(OutputType.ZONE, int(zone_id))
         elif zone_vol_match:
             zone_id = zone_vol_match.group(1)
-            pattern = f"<Z{zone_id}.MU,L"
+            pattern = MixerProtocol.command_volume_pattern(OutputType.ZONE, int(zone_id))
         elif group_src_match:
             group_id = group_src_match.group(1)
-            pattern = f"<G{group_id}.MU,S"
+            pattern = MixerProtocol.command_source_pattern(OutputType.GROUP, int(group_id))
         elif group_vol_match:
             group_id = group_vol_match.group(1)
-            pattern = f"<G{group_id}.MU,L"
+            pattern = MixerProtocol.command_volume_pattern(OutputType.GROUP, int(group_id))
         else:
             return
         
@@ -1055,60 +1026,90 @@ class DCM1Mixer:
     def enqueue_zone_source_query_commands(self):
         self._logger.info(f"Sending status query messages for all zones")
         for zone_id in range(1, self._zone_count + 1):
-            self._enqueue_command(f"<Z{zone_id}.MU,SQ/>\r", PRIORITY_READ)
+            self._enqueue_command(
+                MixerProtocol.command_query_source(OutputType.ZONE, zone_id),
+                PRIORITY_READ,
+            )
 
     def enqueue_zone_label_query_commands(self):
         self._logger.info(f"Querying zone labels")
         for zone_id in range(1, self._zone_count + 1):
-            self._enqueue_command(f"<Z{zone_id},LQ/>\r", PRIORITY_READ)
+            self._enqueue_command(
+                MixerProtocol.command_query_label(OutputType.ZONE, zone_id),
+                PRIORITY_READ,
+            )
 
     def enqueue_source_label_query_commands(self):
         self._logger.info(f"Querying source labels")
         for source_id in range(1, self._source_count + 1):
-            self._enqueue_command(f"<L{source_id},LQ/>\r", PRIORITY_READ)
+            self._enqueue_command(
+                MixerProtocol.command_query_source_label(source_id),
+                PRIORITY_READ,
+            )
 
     def enqueue_zone_volume_level_query_commands(self):
         self._logger.info(f"Querying zone volume levels")
         for zone_id in range(1, self._zone_count + 1):
-            self._enqueue_command(f"<Z{zone_id}.MU,LQ/>\r", PRIORITY_READ)
+            self._enqueue_command(
+                MixerProtocol.command_query_volume(OutputType.ZONE, zone_id),
+                PRIORITY_READ,
+            )
 
     def enqueue_zone_line_input_enable_query_commands(self):
         """Query which line inputs are enabled for all zones (1-8)."""
         self._logger.info("Querying line input enables for all zones")
         for zone_id in range(1, self._zone_count + 1):
             for line_id in range(1, self._source_count + 1):
-                self._enqueue_command(f"<Z{zone_id}.L{line_id},Q/>\r", PRIORITY_READ)
+                self._enqueue_command(
+                    MixerProtocol.command_query_line_input(OutputType.ZONE, zone_id, line_id),
+                    PRIORITY_READ,
+                )
 
     def enqueue_group_line_input_enable_query_commands(self):
         """Query which line inputs are enabled for all groups (1-4)."""
         self._logger.info("Querying line input enables for all groups")
         for group_id in range(1, self._group_count + 1):
             for line_id in range(1, self._source_count + 1):
-                self._enqueue_command(f"<G{group_id}.L{line_id},Q/>\r", PRIORITY_READ)
+                self._enqueue_command(
+                    MixerProtocol.command_query_line_input(OutputType.GROUP, group_id, line_id),
+                    PRIORITY_READ,
+                )
 
     def enqueue_group_status_query_commands(self):
         """Query group status for all groups."""
         self._logger.info("Querying group status for all groups")
         for group_id in range(1, self._group_count + 1):
-            self._enqueue_command(f"<G{group_id},Q/>\r", PRIORITY_READ)
+            self._enqueue_command(
+                MixerProtocol.command_query_group_status(group_id),
+                PRIORITY_READ,
+            )
 
     def enqueue_group_label_query_commands(self):
         """Query group labels for all groups."""
         self._logger.info("Querying group labels for all groups")
         for group_id in range(1, self._group_count + 1):
-            self._enqueue_command(f"<G{group_id},LQ/>\r", PRIORITY_READ)
+            self._enqueue_command(
+                MixerProtocol.command_query_label(OutputType.GROUP, group_id),
+                PRIORITY_READ,
+            )
 
     def enqueue_group_source_query_commands(self):
         """Query group source for all groups."""
         self._logger.info("Querying group source for all groups")
         for group_id in range(1, self._group_count + 1):
-            self._enqueue_command(f"<G{group_id}.MU,SQ/>\r", PRIORITY_READ)
+            self._enqueue_command(
+                MixerProtocol.command_query_source(OutputType.GROUP, group_id),
+                PRIORITY_READ,
+            )
 
     def enqueue_group_volume_level_query_commands(self):
         """Query group volume level for all groups."""
         self._logger.info("Querying group volume levels for all groups")
         for group_id in range(1, self._group_count + 1):
-            self._enqueue_command(f"<G{group_id}.MU,LQ/>\r", PRIORITY_READ)
+            self._enqueue_command(
+                MixerProtocol.command_query_volume(OutputType.GROUP, group_id),
+                PRIORITY_READ,
+            )
 
     # ========== Helper methods (for backward compatibility with old API) ==========
 
