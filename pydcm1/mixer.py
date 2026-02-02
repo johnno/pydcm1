@@ -557,13 +557,6 @@ class DCM1Mixer:
         # Create protocol instance
         self._protocol = MixerProtocol(self._multiplex_callback)
 
-    # ========== Properties ==========
-
-    @property
-    def protocol(self):
-        """Access to internal protocol instance for backward compatibility."""
-        return self._protocol
-
     # ========== Connection lifecycle handlers ==========
     
     def _on_connected(self):
@@ -650,18 +643,18 @@ class DCM1Mixer:
         self._connection_watchdog_task = self._loop.create_task(self._connection_watchdog())
         
         # Query configuration
-        self.enqueue_source_label_query_commands()
-        self.enqueue_zone_label_query_commands()
-        self.enqueue_zone_line_input_enable_query_commands()
-        self.enqueue_group_status_query_commands()
-        self.enqueue_group_label_query_commands()
-        self.enqueue_group_line_input_enable_query_commands()
+        self._enqueue_source_label_query_commands()
+        self._enqueue_zone_label_query_commands()
+        self._enqueue_zone_line_input_enable_query_commands()
+        self._enqueue_group_status_query_commands()
+        self._enqueue_group_label_query_commands()
+        self._enqueue_group_line_input_enable_query_commands()
 
         # Query operational status
-        self.enqueue_zone_source_query_commands()
-        self.enqueue_zone_volume_level_query_commands()
-        self.enqueue_group_source_query_commands()
-        self.enqueue_group_volume_level_query_commands()
+        self._enqueue_zone_source_query_commands()
+        self._enqueue_zone_volume_level_query_commands()
+        self._enqueue_group_source_query_commands()
+        self._enqueue_group_volume_level_query_commands()
 
     def _on_disconnected(self):
         """Called by MixerListener when connection is lost."""
@@ -1049,7 +1042,7 @@ class DCM1Mixer:
 
     # ========== Query commands ==========
 
-    def enqueue_zone_source_query_commands(self):
+    def _enqueue_zone_source_query_commands(self):
         self._logger.info(f"Sending status query messages for all zones")
         for zone_id in range(1, self._zone_count + 1):
             self._enqueue_command(
@@ -1057,7 +1050,7 @@ class DCM1Mixer:
                 PRIORITY_READ,
             )
 
-    def enqueue_zone_label_query_commands(self):
+    def _enqueue_zone_label_query_commands(self):
         self._logger.info(f"Querying zone labels")
         for zone_id in range(1, self._zone_count + 1):
             self._enqueue_command(
@@ -1065,7 +1058,7 @@ class DCM1Mixer:
                 PRIORITY_READ,
             )
 
-    def enqueue_source_label_query_commands(self):
+    def _enqueue_source_label_query_commands(self):
         self._logger.info(f"Querying source labels")
         for source_id in range(1, self._source_count + 1):
             self._enqueue_command(
@@ -1073,7 +1066,7 @@ class DCM1Mixer:
                 PRIORITY_READ,
             )
 
-    def enqueue_zone_volume_level_query_commands(self):
+    def _enqueue_zone_volume_level_query_commands(self):
         self._logger.info(f"Querying zone volume levels")
         for zone_id in range(1, self._zone_count + 1):
             self._enqueue_command(
@@ -1081,7 +1074,7 @@ class DCM1Mixer:
                 PRIORITY_READ,
             )
 
-    def enqueue_zone_line_input_enable_query_commands(self):
+    def _enqueue_zone_line_input_enable_query_commands(self):
         """Query which line inputs are enabled for all zones (1-8)."""
         self._logger.info("Querying line input enables for all zones")
         for zone_id in range(1, self._zone_count + 1):
@@ -1091,7 +1084,7 @@ class DCM1Mixer:
                     PRIORITY_READ,
                 )
 
-    def enqueue_group_line_input_enable_query_commands(self):
+    def _enqueue_group_line_input_enable_query_commands(self):
         """Query which line inputs are enabled for all groups (1-4)."""
         self._logger.info("Querying line input enables for all groups")
         for group_id in range(1, self._group_count + 1):
@@ -1101,7 +1094,7 @@ class DCM1Mixer:
                     PRIORITY_READ,
                 )
 
-    def enqueue_group_status_query_commands(self):
+    def _enqueue_group_status_query_commands(self):
         """Query group status for all groups."""
         self._logger.info("Querying group status for all groups")
         for group_id in range(1, self._group_count + 1):
@@ -1110,7 +1103,7 @@ class DCM1Mixer:
                 PRIORITY_READ,
             )
 
-    def enqueue_group_label_query_commands(self):
+    def _enqueue_group_label_query_commands(self):
         """Query group labels for all groups."""
         self._logger.info("Querying group labels for all groups")
         for group_id in range(1, self._group_count + 1):
@@ -1119,7 +1112,7 @@ class DCM1Mixer:
                 PRIORITY_READ,
             )
 
-    def enqueue_group_source_query_commands(self):
+    def _enqueue_group_source_query_commands(self):
         """Query group source for all groups."""
         self._logger.info("Querying group source for all groups")
         for group_id in range(1, self._group_count + 1):
@@ -1128,7 +1121,7 @@ class DCM1Mixer:
                 PRIORITY_READ,
             )
 
-    def enqueue_group_volume_level_query_commands(self):
+    def _enqueue_group_volume_level_query_commands(self):
         """Query group volume level for all groups."""
         self._logger.info("Querying group volume levels for all groups")
         for group_id in range(1, self._group_count + 1):
@@ -1141,28 +1134,19 @@ class DCM1Mixer:
 
     def query_status(self):
         """Query all relevant mixer state from the device."""
-        self.query_source_labels()
-        self.query_all_zones()
-        self.query_all_groups()
-
-    def query_source_labels(self):
-        """Query all source labels from the device."""
-        self.enqueue_source_label_query_commands()
-
-    def query_all_zones(self):
-        """Query all zone labels, sources, line input enables, and volume levels from the device."""
-        self.enqueue_zone_label_query_commands()
-        self.enqueue_zone_source_query_commands()
-        self.enqueue_zone_line_input_enable_query_commands()
-        self.enqueue_zone_volume_level_query_commands()
-
-    def query_all_groups(self):
-        """Query all group statuses, labels, sources, line input enables, and volume levels from the device."""
-        self.enqueue_group_status_query_commands()
-        self.enqueue_group_label_query_commands()
-        self.enqueue_group_line_input_enable_query_commands()        
-        self.enqueue_group_source_query_commands()
-        self.enqueue_group_volume_level_query_commands()
+        # Query source labels
+        self._enqueue_source_label_query_commands()
+        # Query all zones
+        self._enqueue_zone_label_query_commands()
+        self._enqueue_zone_source_query_commands()
+        self._enqueue_zone_line_input_enable_query_commands()
+        self._enqueue_zone_volume_level_query_commands()
+        # Query all groups
+        self._enqueue_group_status_query_commands()
+        self._enqueue_group_label_query_commands()
+        self._enqueue_group_line_input_enable_query_commands()
+        self._enqueue_group_source_query_commands()
+        self._enqueue_group_volume_level_query_commands()
 
     async def wait_for_source_labels(self, timeout: float = 6.0):
         """Wait for all source labels to be received from the device."""
@@ -1183,13 +1167,13 @@ class DCM1Mixer:
         start_time = self._loop.time()
         expected_zone_ids = set(self.zones_by_id.keys())
         while self._loop.time() - start_time < timeout:
-            all_received = all(
-                self.zones_by_id[zid].label_received and
-                self.zones_by_id[zid].line_inputs_received and
-                self.zones_by_id[zid].volume_received and
-                self.zones_by_id[zid].source_received
-                for zid in expected_zone_ids
-            )
+            all_received = True
+            for zid in expected_zone_ids:
+                zone = self.zones_by_id[zid]
+                if not (zone.label_received and zone.line_inputs_received and 
+                        zone.volume_received and zone.source_received):
+                    all_received = False
+                    break
             if all_received:
                 return True
             await asyncio.sleep(0.1)
@@ -1213,14 +1197,14 @@ class DCM1Mixer:
         start_time = self._loop.time()
         expected_group_ids = set(self.groups_by_id.keys())
         while self._loop.time() - start_time < timeout:
-            all_received = all(
-                self.groups_by_id[gid].label_received and
-                self.groups_by_id[gid].status_received and
-                self.groups_by_id[gid].volume_received and
-                self.groups_by_id[gid].line_inputs_received and
-                self.groups_by_id[gid].source_received
-                for gid in expected_group_ids
-            )
+            all_received = True
+            for gid in expected_group_ids:
+                group = self.groups_by_id[gid]
+                if not (group.label_received and group.status_received and
+                        group.volume_received and group.line_inputs_received and
+                        group.source_received):
+                    all_received = False
+                    break
             if all_received:
                 return True
             await asyncio.sleep(0.1)
