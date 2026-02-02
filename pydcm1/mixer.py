@@ -509,18 +509,68 @@ class DCM1Mixer:
 
     def set_zone_source(self, zone_id: int, source_id: int):
         """Set a zone to use a specific source."""
+        # Validate inputs
+        if not (1 <= source_id <= self._source_count):
+            self._logger.error(f"Invalid source_id {source_id}, must be 1-{self._source_count}")
+            return
+        if not (1 <= zone_id <= self._zone_count):
+            self._logger.error(f"Invalid zone_id {zone_id}, must be 1-{self._zone_count}")
+            return
+        
         self.send_zone_source(source_id, zone_id)
 
     def set_zone_volume(self, zone_id: int, level):
         """Set volume level for a zone."""
+        # Validate inputs
+        if not (1 <= zone_id <= self._zone_count):
+            self._logger.error(f"Invalid zone_id {zone_id}, must be 1-{self._zone_count}")
+            return
+        
+        if isinstance(level, str):
+            if level.lower() != "mute":
+                self._logger.error(f"Invalid level string '{level}', must be 'mute' or integer 0-62")
+                return
+        elif isinstance(level, int):
+            if not (0 <= level <= 62):
+                self._logger.error(f"Invalid level {level}, must be 0-62 (62=mute)")
+                return
+        else:
+            self._logger.error(f"Invalid level type {type(level)}, must be int or 'mute'")
+            return
+        
         self.send_zone_volume_level(zone_id, level)
 
     def set_group_source(self, group_id: int, source_id: int):
         """Set a group to use a specific source."""
+        # Validate inputs
+        if not (1 <= source_id <= self._source_count):
+            self._logger.error(f"Invalid source_id {source_id}, must be 1-{self._source_count}")
+            return
+        if not (1 <= group_id <= self._group_count):
+            self._logger.error(f"Invalid group_id {group_id}, must be 1-{self._group_count}")
+            return
+        
         self.send_group_source(source_id, group_id)
 
     def set_group_volume(self, group_id: int, level):
         """Set volume level for a group."""
+        # Validate inputs
+        if not (1 <= group_id <= self._group_count):
+            self._logger.error(f"Invalid group_id {group_id}, must be 1-{self._group_count}")
+            return
+        
+        if isinstance(level, str):
+            if level.lower() != "mute":
+                self._logger.error(f"Invalid level string '{level}', must be 'mute' or integer 0-62")
+                return
+        elif isinstance(level, int):
+            if not (0 <= level <= 62):
+                self._logger.error(f"Invalid level {level}, must be 0-62 (62=mute)")
+                return
+        else:
+            self._logger.error(f"Invalid level type {type(level)}, must be int or 'mute'")
+            return
+        
         self.send_group_volume_level(group_id, level)
 
     # ========== Command sending methods ==========
@@ -530,13 +580,6 @@ class DCM1Mixer:
         self._logger.info(
             f"Source request - Zone: {zone_id} to source: {source_id} (debounced)"
         )
-        # Validate inputs early
-        if not (1 <= source_id <= self._source_count):
-            self._logger.error(f"Invalid source_id {source_id}, must be 1-{self._source_count}")
-            return
-        if not (1 <= zone_id <= self._zone_count):
-            self._logger.error(f"Invalid zone_id {zone_id}, must be 1-{self._zone_count}")
-            return
         
         zone = self.zones_by_id.get(zone_id)
         if not zone:
@@ -561,26 +604,13 @@ class DCM1Mixer:
 
     def send_zone_volume_level(self, zone_id: int, level):
         """Set volume level for a zone with debounce to prevent command collisions."""
-        # Validate inputs early
-        if not (1 <= zone_id <= self._zone_count):
-            self._logger.error(f"Invalid zone_id {zone_id}, must be 1-{self._zone_count}")
-            return
-        
+        # Convert level to string format for command
         if isinstance(level, str):
-            if level.lower() != "mute":
-                self._logger.error(f"Invalid level string '{level}', must be 'mute' or integer 0-62")
-                return
             level_str = "62"
             expected_level = 62
-        elif isinstance(level, int):
-            if not (0 <= level <= 62):
-                self._logger.error(f"Invalid level {level}, must be 0-62 (62=mute)")
-                return
+        else:  # isinstance(level, int) - already validated in set_zone_volume
             level_str = str(level)
             expected_level = level
-        else:
-            self._logger.error(f"Invalid level type {type(level)}, must be int or 'mute'")
-            return
         
         self._logger.info(f"Volume request - Zone: {zone_id} to level: {level} (debounced)")
         
@@ -610,13 +640,6 @@ class DCM1Mixer:
         self._logger.info(
             f"Source request - Group: {group_id} to source: {source_id} (debounced)"
         )
-        # Validate inputs early
-        if not (1 <= source_id <= self._source_count):
-            self._logger.error(f"Invalid source_id {source_id}, must be 1-{self._source_count}")
-            return
-        if not (1 <= group_id <= self._group_count):
-            self._logger.error(f"Invalid group_id {group_id}, must be 1-{self._group_count}")
-            return
         
         group = self.groups_by_id.get(group_id)
         if not group:
@@ -641,26 +664,13 @@ class DCM1Mixer:
 
     def send_group_volume_level(self, group_id: int, level):
         """Set volume level for a group with debounce."""
-        # Validate inputs early
-        if not (1 <= group_id <= self._group_count):
-            self._logger.error(f"Invalid group_id {group_id}, must be 1-{self._group_count}")
-            return
-        
+        # Convert level to string format for command
         if isinstance(level, str):
-            if level.lower() != "mute":
-                self._logger.error(f"Invalid level string '{level}', must be 'mute' or integer 0-62")
-                return
             level_str = "62"
             expected_level = 62
-        elif isinstance(level, int):
-            if not (0 <= level <= 62):
-                self._logger.error(f"Invalid level {level}, must be 0-62 (62=mute)")
-                return
+        else:  # isinstance(level, int) - already validated in set_group_volume
             level_str = str(level)
             expected_level = level
-        else:
-            self._logger.error(f"Invalid level type {type(level)}, must be int or 'mute'")
-            return
         
         self._logger.info(f"Volume request - Group: {group_id} to level: {level} (debounced)")
         
