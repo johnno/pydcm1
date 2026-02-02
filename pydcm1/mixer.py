@@ -357,6 +357,14 @@ class MixerListener(MixerResponseListener):
 
     def __init__(self, mixer):
         self._mixer = mixer
+    
+    def connected(self):
+        """Forward connection event to mixer."""
+        self._mixer._on_connected()
+    
+    def disconnected(self):
+        """Forward disconnection event to mixer."""
+        self._mixer._on_disconnected()
         
     def source_label_received(self, source_id: int, label: str):
         """Update the source label when received from device."""
@@ -449,13 +457,14 @@ class DCM1Mixer:
     
     This class:
     - Creates and manages MixerProtocol instance
-    - Implements MixerResponseListener to receive transport callbacks
     - Manages command queue, worker, heartbeat, watchdog
     - Tracks inflight commands for recovery on reconnection
     - Debounces volume and source changes
     - Confirms commands by querying device
     - Handles reconnection logic
     - Manages domain objects (Zone, Source, Group)
+    
+    Connection lifecycle events are forwarded from MixerListener.
     """
 
     def __init__(self, hostname, port, enable_heartbeat=True, heartbeat_time=10,
@@ -541,10 +550,9 @@ class DCM1Mixer:
         # Create multiplexing listener for external listeners
         self._multiplex_callback = MultiplexingListener()
         
-        # Register internal listener to update mixer state
+        # Register internal listener to update mixer state and handle connection lifecycle
         self._mixer_listener = MixerListener(self)
         self._multiplex_callback.register_listener(self._mixer_listener)
-        self._multiplex_callback.register_listener(self)
         
         # Create protocol instance
         self._protocol = MixerProtocol(self._multiplex_callback)
@@ -556,10 +564,10 @@ class DCM1Mixer:
         """Access to internal protocol instance for backward compatibility."""
         return self._protocol
 
-    # ========== MixerResponseListener implementation (pass-through to multiplexer) ==========
+    # ========== Connection lifecycle handlers ==========
     
-    def connected(self):
-        """Called by protocol when connection is established."""
+    def _on_connected(self):
+        """Called by MixerListener when connection is established."""
         self._logger.info("Mixer connected")
         self._connected = True
         self._last_receive_timestamp = time.time()
@@ -655,57 +663,9 @@ class DCM1Mixer:
         self.enqueue_group_source_query_commands()
         self.enqueue_group_volume_level_query_commands()
 
-    def disconnected(self):
-        """Called by protocol when connection is lost."""
+    def _on_disconnected(self):
+        """Called by MixerListener when connection is lost."""
         self._handle_connection_broken()
-
-    def source_label_received(self, source_id: int, label: str):
-        """No-op listener hook (handled by MixerListener)."""
-        return None
-
-    def zone_label_received(self, zone_id: int, label: str):
-        """No-op listener hook (handled by MixerListener)."""
-        return None
-
-    def zone_line_inputs_received(self, zone_id: int, enabled_inputs: dict[int, bool]):
-        """No-op listener hook (handled by MixerListener)."""
-        return None
-
-    def group_status_received(self, group_id: int, enabled: bool, zones: list[int]):
-        """No-op listener hook (handled by MixerListener)."""
-        return None
-
-    def group_label_received(self, group_id: int, label: str):
-        """No-op listener hook (handled by MixerListener)."""
-        return None
-
-    def group_line_inputs_received(self, group_id: int, enabled_inputs: dict[int, bool]):
-        """No-op listener hook (handled by MixerListener)."""
-        return None
-
-    def zone_source_received(self, zone_id: int, source_id: int):
-        """No-op listener hook (handled by MixerListener)."""
-        return None
-
-    def zone_volume_level_received(self, zone_id: int, level):
-        """No-op listener hook (handled by MixerListener)."""
-        return None
-
-    def group_source_received(self, group_id: int, source_id: int):
-        """No-op listener hook (handled by MixerListener)."""
-        return None
-
-    def group_volume_level_received(self, group_id: int, level):
-        """No-op listener hook (handled by MixerListener)."""
-        return None
-
-    def error(self, error_message: str):
-        """No-op listener hook (handled by MixerListener)."""
-        return None
-
-    def source_change_requested(self, zone_id: int, source_id: int):
-        """No-op listener hook (handled by MixerListener)."""
-        return None
 
     # ========== Public API ==========
 
