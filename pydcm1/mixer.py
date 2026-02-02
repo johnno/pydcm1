@@ -514,9 +514,6 @@ class DCM1Mixer:
         self.sources_by_name: dict[str, Source] = {}
         self.groups_by_id: dict[int, Group] = {}
         self.groups_by_name: dict[str, Group] = {}
-        self.mac: Optional[str] = None
-        self.device_name: Optional[str] = None
-        self.firmware_version: Optional[str] = None
 
         # Connection state
         self._connected = False
