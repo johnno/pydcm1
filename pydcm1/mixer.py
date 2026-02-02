@@ -38,190 +38,271 @@ PRIORITY_READ = 20    # Read commands that query device state (all queries, conf
 class Source:
     """Represents a source in the DCM1 mixer."""
     def __init__(self, source_id: int, name: str):
-        self.id = source_id
-        self.name = name
-        
-        # Tracking: Whether label has been received from device
-        self.label_received: bool = False
+        self._id = source_id
+        self._name = name
+        self._label_received: bool = False
+    
+    @property
+    def id(self) -> int:
+        """Source ID."""
+        return self._id
+    
+    @property
+    def name(self) -> str:
+        """Source name/label."""
+        return self._name
+    
+    @property
+    def label_received(self) -> bool:
+        """Whether label has been received from device."""
+        return self._label_received
 
 
 class Output(ABC):
     """Base class for Zone/Group outputs with shared control logic."""
     def __init__(self, output_id: int, name: str, mixer: 'DCM1Mixer' = None):
-        self.id = output_id
-        self.name = name
-        self.mixer = mixer  # Reference to parent mixer for validation and control
+        self._id = output_id
+        self._name = name
+        self._mixer = mixer  # Reference to parent mixer for validation and control
 
-        # State: Operational values
-        self.source: Optional[int] = None
-        self.volume: Optional[int | str] = None
-        self.line_inputs: dict[int, bool] = {}  # Maps line_id to enabled bool
+        # State: Operational values (stored with underscore prefix)
+        self._source: Optional[int] = None
+        self._volume: Optional[int | str] = None
+        self._line_inputs: dict[int, bool] = {}  # Maps line_id to enabled bool
 
-        # Control: Debounce and confirmation tasks
-        self.source_debounce_task: Optional[Task[Any]] = None
-        self.volume_debounce_task: Optional[Task[Any]] = None
-        self.source_confirm_task: Optional[Task[Any]] = None
-        self.volume_confirm_task: Optional[Task[Any]] = None
+        # Control: Debounce and confirmation tasks (private implementation details)
+        self._source_debounce_task: Optional[Task[Any]] = None
+        self._volume_debounce_task: Optional[Task[Any]] = None
+        self._source_confirm_task: Optional[Task[Any]] = None
+        self._volume_confirm_task: Optional[Task[Any]] = None
 
         # Tracking: Which attributes have been received from device
-        self.label_received: bool = False
-        self.line_inputs_received: bool = False
-        self.source_received: bool = False
-        self.volume_received: bool = False
+        self._label_received: bool = False
+        self._line_inputs_received: bool = False
+        self._source_received: bool = False
+        self._volume_received: bool = False
 
+    @property
+    def id(self) -> int:
+        """Output ID."""
+        return self._id
+
+    @property
+    def name(self) -> str:
+        """Output name/label."""
+        return self._name
+
+    @property
+    def label_received(self) -> bool:
+        """Whether label has been received from device."""
+        return self._label_received
+
+    @property
+    def source(self) -> Optional[int]:
+        """Source ID for this output."""
+        return self._source
+
+    @property
+    def source_received(self) -> bool:
+        """Whether source has been received from device."""
+        return self._source_received
+
+    @property
+    def volume(self) -> Optional[int | str]:
+        """Volume level for this output."""
+        return self._volume
+
+    @property
+    def volume_received(self) -> bool:
+        """Whether volume has been received from device."""
+        return self._volume_received
+
+    @property
+    def line_inputs(self) -> dict[int, bool]:
+        """Line inputs enabled for this output."""
+        return self._line_inputs
+
+    @property
+    def line_inputs_received(self) -> bool:
+        """Whether line inputs have been received from device."""
+        return self._line_inputs_received
+
+    def _update_volume_unless_debouncing(self, value: Optional[int | str]):
+        """Update volume from device only if not currently debouncing. Ignores stale responses."""
+        if self._volume_debounce_task and not self._volume_debounce_task.done():
+            if self._mixer:
+                self._mixer._logger.debug(
+                    f"Ignoring stale volume response for {self._type_name} {self._id} while command is debouncing"
+                )
+            return
+        self._volume = value
+        if value is not None:
+            self._volume_received = True
+
+    def _update_source_unless_debouncing(self, value: Optional[int]):
+        """Update source from device only if not currently debouncing. Ignores stale responses."""
+        if self._source_debounce_task and not self._source_debounce_task.done():
+            if self._mixer:
+                self._mixer._logger.debug(
+                    f"Ignoring stale source response for {self._type_name} {self._id} while command is debouncing"
+                )
+            return
+        self._source = value
+        if value is not None:
+            self._source_received = True
 
     def set_source(self, source_id: int):
         """Set source for this output with validation."""
-        if not self.mixer:
-            raise RuntimeError(f"{self._type_name} {self.id} has no mixer reference")
-        if not (1 <= source_id <= self.mixer._source_count):
-            self.mixer._logger.error(
-                f"Invalid source_id {source_id}, must be 1-{self.mixer._source_count}"
+        if not self._mixer:
+            raise RuntimeError(f"{self._type_name} {self._id} has no mixer reference")
+        if not (1 <= source_id <= self._mixer._source_count):
+            self._mixer._logger.error(
+                f"Invalid source_id {source_id}, must be 1-{self._mixer._source_count}"
             )
             return
         self._send_source(source_id)
 
     def _send_source(self, source_id: int):
         """Send source command with debounce."""
-        if not self.mixer:
+        if not self._mixer:
             return
-        self.mixer._logger.info(
-            f"Source request - {self._type_name}: {self.id} to source: {source_id} (debounced)"
+        self._mixer._logger.info(
+            f"Source request - {self._type_name}: {self._id} to source: {source_id} (debounced)"
         )
 
         # Cancel any pending debounce/confirm tasks
-        if self.source_debounce_task and not self.source_debounce_task.done():
-            self.source_debounce_task.cancel()
-        if self.source_confirm_task and not self.source_confirm_task.done():
-            self.source_confirm_task.cancel()
+        if self._source_debounce_task and not self._source_debounce_task.done():
+            self._source_debounce_task.cancel()
+        if self._source_confirm_task and not self._source_confirm_task.done():
+            self._source_confirm_task.cancel()
 
         # Create debounce task
-        self.source_debounce_task = self.mixer._loop.create_task(
+        self._source_debounce_task = self._mixer._loop.create_task(
             self._debounce_source(source_id)
         )
 
     async def _debounce_source(self, source_id: int):
         """Debounce and send source command."""
         try:
-            await asyncio.sleep(self.mixer._volume_debounce_delay)
-            if self.source_debounce_task != asyncio.current_task():
+            await asyncio.sleep(self._mixer._volume_debounce_delay)
+            if self._source_debounce_task != asyncio.current_task():
                 return
-            command = MixerProtocol.command_set_source(self._output_type, self.id, source_id)
-            self.mixer._enqueue_command(command)
-            if self.mixer._command_confirmation:
-                self.source_confirm_task = self.mixer._loop.create_task(
+            command = MixerProtocol.command_set_source(self._output_type, self._id, source_id)
+            self._mixer._enqueue_command(command)
+            if self._mixer._command_confirmation:
+                self._source_confirm_task = self._mixer._loop.create_task(
                     self._confirm_source(source_id)
                 )
-            self.source_debounce_task = None
+            self._source_debounce_task = None
         except asyncio.CancelledError:
-            self.source_debounce_task = None
+            self._source_debounce_task = None
 
     async def _confirm_source(self, expected_source: int):
         """Confirm source was set correctly."""
         await asyncio.sleep(0.3)
-        self.mixer._enqueue_command(
-            MixerProtocol.command_query_source(self._output_type, self.id),
+        self._mixer._enqueue_command(
+            MixerProtocol.command_query_source(self._output_type, self._id),
             PRIORITY_READ,
         )
         await asyncio.sleep(0.5)
 
         if self.source != expected_source:
             # Find and retry inflight command
-            for seq_num in sorted(self.mixer._inflight_commands.keys(), reverse=True):
-                _, msg = self.mixer._inflight_commands[seq_num]
-                if MixerProtocol.command_source_pattern(self._output_type, self.id) in msg:
-                    self.mixer._reenqueue_inflight_command(seq_num)
+            for seq_num in sorted(self._mixer._inflight_commands.keys(), reverse=True):
+                _, msg = self._mixer._inflight_commands[seq_num]
+                if MixerProtocol.command_source_pattern(self._output_type, self._id) in msg:
+                    self._mixer._reenqueue_inflight_command(seq_num)
                     break
         else:
-            self.mixer._clear_latest_inflight_command_by_pattern(
-                MixerProtocol.command_source_pattern(self._output_type, self.id)
+            self._mixer._clear_latest_inflight_command_by_pattern(
+                MixerProtocol.command_source_pattern(self._output_type, self._id)
             )
 
     def set_volume(self, level):
         """Set volume for this output with validation."""
-        if not self.mixer:
-            raise RuntimeError(f"{self._type_name} {self.id} has no mixer reference")
+        if not self._mixer:
+            raise RuntimeError(f"{self._type_name} {self._id} has no mixer reference")
         if isinstance(level, str):
             if level.lower() != "mute":
-                self.mixer._logger.error(
+                self._mixer._logger.error(
                     f"Invalid level string '{level}', must be 'mute' or integer 0-62"
                 )
                 return
         elif isinstance(level, int):
             if not (0 <= level <= 62):
-                self.mixer._logger.error(f"Invalid level {level}, must be 0-62")
+                self._mixer._logger.error(f"Invalid level {level}, must be 0-62")
                 return
         else:
-            self.mixer._logger.error(f"Invalid level type {type(level)}, must be int or 'mute'")
+            self._mixer._logger.error(f"Invalid level type {type(level)}, must be int or 'mute'")
             return
         self._send_volume(level)
 
     def _send_volume(self, level):
         """Send volume command with debounce."""
-        if not self.mixer:
+        if not self._mixer:
             return
 
         level_str = "62" if isinstance(level, str) else str(level)
         expected_level = 62 if isinstance(level, str) else level
 
-        self.mixer._logger.info(
-            f"Volume request - {self._type_name}: {self.id} to level: {level} (debounced)"
+        self._mixer._logger.info(
+            f"Volume request - {self._type_name}: {self._id} to level: {level} (debounced)"
         )
 
         # Cancel any pending debounce/confirm tasks
-        if self.volume_debounce_task and not self.volume_debounce_task.done():
-            self.volume_debounce_task.cancel()
-        if self.volume_confirm_task and not self.volume_confirm_task.done():
-            self.volume_confirm_task.cancel()
+        if self._volume_debounce_task and not self._volume_debounce_task.done():
+            self._volume_debounce_task.cancel()
+        if self._volume_confirm_task and not self._volume_confirm_task.done():
+            self._volume_confirm_task.cancel()
 
         # Create debounce task
-        self.volume_debounce_task = self.mixer._loop.create_task(
+        self._volume_debounce_task = self._mixer._loop.create_task(
             self._debounce_volume(level_str, expected_level)
         )
 
     async def _debounce_volume(self, level_str: str, expected_level: int):
         """Debounce and send volume command."""
         try:
-            await asyncio.sleep(self.mixer._volume_debounce_delay)
-            if self.volume_debounce_task != asyncio.current_task():
+            await asyncio.sleep(self._mixer._volume_debounce_delay)
+            if self._volume_debounce_task != asyncio.current_task():
                 return
-            command = MixerProtocol.command_set_volume(self._output_type, self.id, level_str)
-            self.mixer._enqueue_command(command)
-            if self.mixer._command_confirmation:
-                self.volume_confirm_task = self.mixer._loop.create_task(
+            command = MixerProtocol.command_set_volume(self._output_type, self._id, level_str)
+            self._mixer._enqueue_command(command)
+            if self._mixer._command_confirmation:
+                self._volume_confirm_task = self._mixer._loop.create_task(
                     self._confirm_volume(expected_level)
                 )
-            self.volume_debounce_task = None
+            self._volume_debounce_task = None
         except asyncio.CancelledError:
-            self.volume_debounce_task = None
+            self._volume_debounce_task = None
 
     async def _confirm_volume(self, expected_level: int):
         """Confirm volume was set correctly."""
         await asyncio.sleep(0.3)
-        self.mixer._enqueue_command(
-            MixerProtocol.command_query_volume(self._output_type, self.id),
+        self._mixer._enqueue_command(
+            MixerProtocol.command_query_volume(self._output_type, self._id),
             PRIORITY_READ,
         )
         await asyncio.sleep(0.5)
 
         if self.volume != expected_level and self.volume is not None:
             # Retry query once
-            self.mixer._enqueue_command(
-                MixerProtocol.command_query_volume(self._output_type, self.id),
+            self._mixer._enqueue_command(
+                MixerProtocol.command_query_volume(self._output_type, self._id),
                 PRIORITY_READ,
             )
             await asyncio.sleep(0.4)
 
         if self.volume == expected_level:
-            self.mixer._clear_latest_inflight_command_by_pattern(
-                MixerProtocol.command_volume_pattern(self._output_type, self.id)
+            self._mixer._clear_latest_inflight_command_by_pattern(
+                MixerProtocol.command_volume_pattern(self._output_type, self._id)
             )
         else:
             # Find and retry inflight command
-            for seq_num in sorted(self.mixer._inflight_commands.keys(), reverse=True):
-                _, msg = self.mixer._inflight_commands[seq_num]
-                if MixerProtocol.command_volume_pattern(self._output_type, self.id) in msg:
-                    self.mixer._reenqueue_inflight_command(seq_num)
+            for seq_num in sorted(self._mixer._inflight_commands.keys(), reverse=True):
+                _, msg = self._mixer._inflight_commands[seq_num]
+                if MixerProtocol.command_volume_pattern(self._output_type, self._id) in msg:
+                    self._mixer._reenqueue_inflight_command(seq_num)
                     break
 
 
@@ -232,7 +313,6 @@ class Zone(Output):
 
     def __init__(self, zone_id: int, name: str, mixer: 'DCM1Mixer' = None):
         super().__init__(zone_id, name, mixer=mixer)
-
 
 
 class Group(Output):
@@ -249,11 +329,27 @@ class Group(Output):
         mixer: 'DCM1Mixer' = None,
     ):
         super().__init__(group_id, name, mixer=mixer)
-        self.enabled = enabled
-        self.zones = zones if zones else []
+        self._enabled = enabled
+        self._zones = zones if zones else []
 
         # Tracking: Which attributes have been received from device
-        self.status_received: bool = False
+        self._status_received: bool = False
+
+    @property
+    def enabled(self) -> bool:
+        """Whether group is enabled."""
+        return self._enabled
+
+    @property
+    def zones(self) -> list[int]:
+        """Zone IDs in this group."""
+        return self._zones
+
+    @property
+    def status_received(self) -> bool:
+        """Whether group status has been received from device."""
+        return self._status_received
+
 
 
 class MixerListener(MixerResponseListener):
@@ -270,11 +366,10 @@ class MixerListener(MixerResponseListener):
             old_name = source.name
             if old_name in self._mixer.sources_by_name:
                 del self._mixer.sources_by_name[old_name]
-            # Update source name
-            source.name = label
+            # Update source name and mark label as received
+            source._name = label
+            source._label_received = True
             self._mixer.sources_by_name[label] = source
-            # Track that we received this source's label
-            source.label_received = True
     
     def zone_label_received(self, zone_id: int, label: str):
         """Update the zone label when received from device."""
@@ -284,40 +379,29 @@ class MixerListener(MixerResponseListener):
             old_name = zone.name
             if old_name in self._mixer.zones_by_name:
                 del self._mixer.zones_by_name[old_name]
-            # Update zone name
-            zone.name = label
+            # Update zone name and mark label as received
+            zone._name = label
+            zone._label_received = True
             self._mixer.zones_by_name[label] = zone
-            # Track that we received this zone's label
-            zone.label_received = True
 
     def zone_line_inputs_received(self, zone_id: int, line_inputs: dict[int, bool]):
         """Track when a zone's line input data is received."""
         zone = self._mixer.zones_by_id.get(zone_id)
         if zone:
-            zone.line_inputs = line_inputs
-            zone.line_inputs_received = True
+            zone._line_inputs = line_inputs
+            zone._line_inputs_received = True
 
     def zone_source_received(self, zone_id: int, source_id: int):
         """Track when a zone's source is received from the device."""
         zone = self._mixer.zones_by_id.get(zone_id)
         if zone:
-            zone.source = source_id
-            zone.source_received = True
+            zone._update_source_unless_debouncing(source_id)
 
     def zone_volume_level_received(self, zone_id: int, level):
         """Track when a zone's volume is received from the device."""
         zone = self._mixer.zones_by_id.get(zone_id)
         if zone:
-            # Ignore heartbeat/old responses while a volume command is still debouncing
-            if zone.volume_debounce_task and not zone.volume_debounce_task.done():
-                self._mixer._logger.debug(
-                    "Ignoring volume response for zone %s while command is debounced",
-                    zone_id,
-                )
-                return
-            # Store the data
-            zone.volume = level
-            zone.volume_received = True
+            zone._update_volume_unless_debouncing(level)
 
     def group_label_received(self, group_id: int, label: str):
         """Update the group label when received from device."""
@@ -327,49 +411,37 @@ class MixerListener(MixerResponseListener):
             old_name = group.name
             if old_name in self._mixer.groups_by_name:
                 del self._mixer.groups_by_name[old_name]
-            # Update group name
-            group.name = label
+            # Update group name and mark label as received
+            group._name = label
+            group._label_received = True
             self._mixer.groups_by_name[label] = group
-            # Track that we received this group's label
-            group.label_received = True
     
     def group_status_received(self, group_id: int, enabled: bool, zones: list[int]):
         """Update the group status when received from device."""
         group = self._mixer.groups_by_id.get(group_id)
         if group:
-            group.enabled = enabled
-            group.zones = zones
-            # Track that we received this group's status
-            group.status_received = True
+            group._enabled = enabled
+            group._zones = zones
+            group._status_received = True
     
     def group_volume_level_received(self, group_id: int, level):
         """Track when a group's volume is received."""
         group = self._mixer.groups_by_id.get(group_id)
         if group:
-            # Ignore heartbeat/old responses while a volume command is still debouncing
-            if group.volume_debounce_task and not group.volume_debounce_task.done():
-                self._mixer._logger.debug(
-                    "Ignoring group volume response for group %s while command is debounced",
-                    group_id,
-                )
-                return
-            # Store the data
-            group.volume = level
-            group.volume_received = True
+            group._update_volume_unless_debouncing(level)
     
     def group_line_inputs_received(self, group_id: int, line_inputs: dict[int, bool]):
         """Track when a group's line input data is received."""
         group = self._mixer.groups_by_id.get(group_id)
         if group:
-            group.line_inputs = line_inputs
-            group.line_inputs_received = True
+            group._line_inputs = line_inputs
+            group._line_inputs_received = True
     
     def group_source_received(self, group_id: int, source_id: int):
         """Track when a group's source is received from the device."""
         group = self._mixer.groups_by_id.get(group_id)
         if group:
-            group.source = source_id
-            group.source_received = True
+            group._update_source_unless_debouncing(source_id)
 
 
 class DCM1Mixer:
@@ -517,33 +589,33 @@ class DCM1Mixer:
                 
                 # Cancel and clear all mid-flight debounce/confirm tasks in zones
                 for zone in self.zones_by_id.values():
-                    if zone.source_debounce_task and not zone.source_debounce_task.done():
-                        zone.source_debounce_task.cancel()
-                    zone.source_debounce_task = None
-                    if zone.volume_debounce_task and not zone.volume_debounce_task.done():
-                        zone.volume_debounce_task.cancel()
-                    zone.volume_debounce_task = None
-                    if zone.source_confirm_task and not zone.source_confirm_task.done():
-                        zone.source_confirm_task.cancel()
-                    zone.source_confirm_task = None
-                    if zone.volume_confirm_task and not zone.volume_confirm_task.done():
-                        zone.volume_confirm_task.cancel()
-                    zone.volume_confirm_task = None
+                    if zone._source_debounce_task and not zone._source_debounce_task.done():
+                        zone._source_debounce_task.cancel()
+                    zone._source_debounce_task = None
+                    if zone._volume_debounce_task and not zone._volume_debounce_task.done():
+                        zone._volume_debounce_task.cancel()
+                    zone._volume_debounce_task = None
+                    if zone._source_confirm_task and not zone._source_confirm_task.done():
+                        zone._source_confirm_task.cancel()
+                    zone._source_confirm_task = None
+                    if zone._volume_confirm_task and not zone._volume_confirm_task.done():
+                        zone._volume_confirm_task.cancel()
+                    zone._volume_confirm_task = None
                 
                 # Cancel and clear all mid-flight debounce/confirm tasks in groups
                 for group in self.groups_by_id.values():
-                    if group.source_debounce_task and not group.source_debounce_task.done():
-                        group.source_debounce_task.cancel()
-                    group.source_debounce_task = None
-                    if group.volume_debounce_task and not group.volume_debounce_task.done():
-                        group.volume_debounce_task.cancel()
-                    group.volume_debounce_task = None
-                    if group.source_confirm_task and not group.source_confirm_task.done():
-                        group.source_confirm_task.cancel()
-                    group.source_confirm_task = None
-                    if group.volume_confirm_task and not group.volume_confirm_task.done():
-                        group.volume_confirm_task.cancel()
-                    group.volume_confirm_task = None
+                    if group._source_debounce_task and not group._source_debounce_task.done():
+                        group._source_debounce_task.cancel()
+                    group._source_debounce_task = None
+                    if group._volume_debounce_task and not group._volume_debounce_task.done():
+                        group._volume_debounce_task.cancel()
+                    group._volume_debounce_task = None
+                    if group._source_confirm_task and not group._source_confirm_task.done():
+                        group._source_confirm_task.cancel()
+                    group._source_confirm_task = None
+                    if group._volume_confirm_task and not group._volume_confirm_task.done():
+                        group._volume_confirm_task.cancel()
+                    group._volume_confirm_task = None
                                 
             self._connection_lost_timestamp = None
         
@@ -917,16 +989,16 @@ class DCM1Mixer:
         
         # Cancel confirmation tasks in zone and group objects
         for zone in self.zones_by_id.values():
-            if zone.source_confirm_task and not zone.source_confirm_task.done():
-                zone.source_confirm_task.cancel()
-            if zone.volume_confirm_task and not zone.volume_confirm_task.done():
-                zone.volume_confirm_task.cancel()
+            if zone._source_confirm_task and not zone._source_confirm_task.done():
+                zone._source_confirm_task.cancel()
+            if zone._volume_confirm_task and not zone._volume_confirm_task.done():
+                zone._volume_confirm_task.cancel()
         
         for group in self.groups_by_id.values():
-            if group.source_confirm_task and not group.source_confirm_task.done():
-                group.source_confirm_task.cancel()
-            if group.volume_confirm_task and not group.volume_confirm_task.done():
-                group.volume_confirm_task.cancel()
+            if group._source_confirm_task and not group._source_confirm_task.done():
+                group._source_confirm_task.cancel()
+            if group._volume_confirm_task and not group._volume_confirm_task.done():
+                group._volume_confirm_task.cancel()
         
         if hasattr(self, '_connection_watchdog_task') and self._connection_watchdog_task is not None:
             self._connection_watchdog_task.cancel()
