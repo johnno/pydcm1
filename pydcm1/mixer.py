@@ -34,6 +34,16 @@ PRIORITY_WRITE = 10   # Write commands that change device state (SET volume, SET
 PRIORITY_READ = 20    # Read commands that query device state (all queries, confirmations)
 
 
+class Source:
+    """Represents a source in the DCM1 mixer."""
+    def __init__(self, source_id: int, name: str):
+        self.id = source_id
+        self.name = name
+        
+        # Tracking: Whether label has been received from device
+        self.label_received: bool = False
+
+
 class Zone:
     """Represents a zone in the DCM1 mixer with state and control tracking."""
     def __init__(self, zone_id: int, name: str, mixer: 'DCM1Mixer' = None):
@@ -65,7 +75,54 @@ class Zone:
         if not (1 <= source_id <= self.mixer._source_count):
             self.mixer._logger.error(f"Invalid source_id {source_id}, must be 1-{self.mixer._source_count}")
             return
-        self.mixer.send_zone_source(source_id, self.id)
+        self._send_source(source_id)
+    
+    def _send_source(self, source_id: int):
+        """Send source command with debounce."""
+        if not self.mixer:
+            return
+        self.mixer._logger.info(f"Source request - Zone: {self.id} to source: {source_id} (debounced)")
+        
+        # Cancel any pending debounce/confirm tasks
+        if self.source_debounce_task and not self.source_debounce_task.done():
+            self.source_debounce_task.cancel()
+        if self.source_confirm_task and not self.source_confirm_task.done():
+            self.source_confirm_task.cancel()
+        
+        # Create debounce task
+        self.source_debounce_task = self.mixer._loop.create_task(
+            self._debounce_source(source_id)
+        )
+    
+    async def _debounce_source(self, source_id: int):
+        """Debounce and send source command."""
+        try:
+            await asyncio.sleep(self.mixer._volume_debounce_delay)
+            if self.source_debounce_task != asyncio.current_task():
+                return
+            command = f"<Z{self.id}.MU,S{source_id}/>\r"
+            self.mixer._enqueue_command(command)
+            if self.mixer._command_confirmation:
+                self.source_confirm_task = self.mixer._loop.create_task(self._confirm_source(source_id))
+            self.source_debounce_task = None
+        except asyncio.CancelledError:
+            self.source_debounce_task = None
+    
+    async def _confirm_source(self, expected_source: int):
+        """Confirm source was set correctly."""
+        await asyncio.sleep(0.3)
+        self.mixer._enqueue_command(f"<Z{self.id}.MU,SQ/>\r", PRIORITY_READ)
+        await asyncio.sleep(0.5)
+        
+        if self.source != expected_source:
+            # Find and retry inflight command
+            for seq_num in sorted(self.mixer._inflight_commands.keys(), reverse=True):
+                _, msg = self.mixer._inflight_commands[seq_num]
+                if f"<Z{self.id}.MU,S" in msg:
+                    self.mixer._reenqueue_inflight_command(seq_num)
+                    break
+        else:
+            self.mixer._clear_latest_inflight_command_by_pattern(f"<Z{self.id}.MU,S")
     
     def set_volume(self, level):
         """Set volume for this zone with validation."""
@@ -82,17 +139,63 @@ class Zone:
         else:
             self.mixer._logger.error(f"Invalid level type {type(level)}, must be int or 'mute'")
             return
-        self.mixer.send_zone_volume_level(self.id, level)
-
-
-class Source:
-    """Represents a source in the DCM1 mixer."""
-    def __init__(self, source_id: int, name: str):
-        self.id = source_id
-        self.name = name
+        self._send_volume(level)
+    
+    def _send_volume(self, level):
+        """Send volume command with debounce."""
+        if not self.mixer:
+            return
         
-        # Tracking: Whether label has been received from device
-        self.label_received: bool = False
+        level_str = "62" if isinstance(level, str) else str(level)
+        expected_level = 62 if isinstance(level, str) else level
+        
+        self.mixer._logger.info(f"Volume request - Zone: {self.id} to level: {level} (debounced)")
+        
+        # Cancel any pending debounce/confirm tasks
+        if self.volume_debounce_task and not self.volume_debounce_task.done():
+            self.volume_debounce_task.cancel()
+        if self.volume_confirm_task and not self.volume_confirm_task.done():
+            self.volume_confirm_task.cancel()
+        
+        # Create debounce task
+        self.volume_debounce_task = self.mixer._loop.create_task(
+            self._debounce_volume(level_str, expected_level)
+        )
+    
+    async def _debounce_volume(self, level_str: str, expected_level: int):
+        """Debounce and send volume command."""
+        try:
+            await asyncio.sleep(self.mixer._volume_debounce_delay)
+            if self.volume_debounce_task != asyncio.current_task():
+                return
+            command = f"<Z{self.id}.MU,L{level_str}/>\r"
+            self.mixer._enqueue_command(command)
+            if self.mixer._command_confirmation:
+                self.volume_confirm_task = self.mixer._loop.create_task(self._confirm_volume(expected_level))
+            self.volume_debounce_task = None
+        except asyncio.CancelledError:
+            self.volume_debounce_task = None
+    
+    async def _confirm_volume(self, expected_level: int):
+        """Confirm volume was set correctly."""
+        await asyncio.sleep(0.3)
+        self.mixer._enqueue_command(f"<Z{self.id}.MU,LQ/>\r", PRIORITY_READ)
+        await asyncio.sleep(0.5)
+        
+        if self.volume != expected_level and self.volume is not None:
+            # Retry query once
+            self.mixer._enqueue_command(f"<Z{self.id}.MU,LQ/>\r", PRIORITY_READ)
+            await asyncio.sleep(0.4)
+        
+        if self.volume == expected_level:
+            self.mixer._clear_latest_inflight_command_by_pattern(f"<Z{self.id}.MU,L")
+        else:
+            # Find and retry inflight command
+            for seq_num in sorted(self.mixer._inflight_commands.keys(), reverse=True):
+                _, msg = self.mixer._inflight_commands[seq_num]
+                if f"<Z{self.id}.MU,L" in msg:
+                    self.mixer._reenqueue_inflight_command(seq_num)
+                    break
 
 
 class Group:
@@ -129,7 +232,54 @@ class Group:
         if not (1 <= source_id <= self.mixer._source_count):
             self.mixer._logger.error(f"Invalid source_id {source_id}, must be 1-{self.mixer._source_count}")
             return
-        self.mixer.send_group_source(source_id, self.id)
+        self._send_source(source_id)
+    
+    def _send_source(self, source_id: int):
+        """Send source command with debounce."""
+        if not self.mixer:
+            return
+        self.mixer._logger.info(f"Source request - Group: {self.id} to source: {source_id} (debounced)")
+        
+        # Cancel any pending debounce/confirm tasks
+        if self.source_debounce_task and not self.source_debounce_task.done():
+            self.source_debounce_task.cancel()
+        if self.source_confirm_task and not self.source_confirm_task.done():
+            self.source_confirm_task.cancel()
+        
+        # Create debounce task
+        self.source_debounce_task = self.mixer._loop.create_task(
+            self._debounce_source(source_id)
+        )
+    
+    async def _debounce_source(self, source_id: int):
+        """Debounce and send source command."""
+        try:
+            await asyncio.sleep(self.mixer._volume_debounce_delay)
+            if self.source_debounce_task != asyncio.current_task():
+                return
+            command = f"<G{self.id}.MU,S{source_id}/>\r"
+            self.mixer._enqueue_command(command)
+            if self.mixer._command_confirmation:
+                self.source_confirm_task = self.mixer._loop.create_task(self._confirm_source(source_id))
+            self.source_debounce_task = None
+        except asyncio.CancelledError:
+            self.source_debounce_task = None
+    
+    async def _confirm_source(self, expected_source: int):
+        """Confirm source was set correctly."""
+        await asyncio.sleep(0.3)
+        self.mixer._enqueue_command(f"<G{self.id}.MU,SQ/>\r", PRIORITY_READ)
+        await asyncio.sleep(0.5)
+        
+        if self.source != expected_source:
+            # Find and retry inflight command
+            for seq_num in sorted(self.mixer._inflight_commands.keys(), reverse=True):
+                _, msg = self.mixer._inflight_commands[seq_num]
+                if f"<G{self.id}.MU,S" in msg:
+                    self.mixer._reenqueue_inflight_command(seq_num)
+                    break
+        else:
+            self.mixer._clear_latest_inflight_command_by_pattern(f"<G{self.id}.MU,S")
     
     def set_volume(self, level):
         """Set volume for this group with validation."""
@@ -146,7 +296,63 @@ class Group:
         else:
             self.mixer._logger.error(f"Invalid level type {type(level)}, must be int or 'mute'")
             return
-        self.mixer.send_group_volume_level(self.id, level)
+        self._send_volume(level)
+    
+    def _send_volume(self, level):
+        """Send volume command with debounce."""
+        if not self.mixer:
+            return
+        
+        level_str = "62" if isinstance(level, str) else str(level)
+        expected_level = 62 if isinstance(level, str) else level
+        
+        self.mixer._logger.info(f"Volume request - Group: {self.id} to level: {level} (debounced)")
+        
+        # Cancel any pending debounce/confirm tasks
+        if self.volume_debounce_task and not self.volume_debounce_task.done():
+            self.volume_debounce_task.cancel()
+        if self.volume_confirm_task and not self.volume_confirm_task.done():
+            self.volume_confirm_task.cancel()
+        
+        # Create debounce task
+        self.volume_debounce_task = self.mixer._loop.create_task(
+            self._debounce_volume(level_str, expected_level)
+        )
+    
+    async def _debounce_volume(self, level_str: str, expected_level: int):
+        """Debounce and send volume command."""
+        try:
+            await asyncio.sleep(self.mixer._volume_debounce_delay)
+            if self.volume_debounce_task != asyncio.current_task():
+                return
+            command = f"<G{self.id}.MU,L{level_str}/>\r"
+            self.mixer._enqueue_command(command)
+            if self.mixer._command_confirmation:
+                self.volume_confirm_task = self.mixer._loop.create_task(self._confirm_volume(expected_level))
+            self.volume_debounce_task = None
+        except asyncio.CancelledError:
+            self.volume_debounce_task = None
+    
+    async def _confirm_volume(self, expected_level: int):
+        """Confirm volume was set correctly."""
+        await asyncio.sleep(0.3)
+        self.mixer._enqueue_command(f"<G{self.id}.MU,LQ/>\r", PRIORITY_READ)
+        await asyncio.sleep(0.5)
+        
+        if self.volume != expected_level and self.volume is not None:
+            # Retry query once
+            self.mixer._enqueue_command(f"<G{self.id}.MU,LQ/>\r", PRIORITY_READ)
+            await asyncio.sleep(0.4)
+        
+        if self.volume == expected_level:
+            self.mixer._clear_latest_inflight_command_by_pattern(f"<G{self.id}.MU,L")
+        else:
+            # Find and retry inflight command
+            for seq_num in sorted(self.mixer._inflight_commands.keys(), reverse=True):
+                _, msg = self.mixer._inflight_commands[seq_num]
+                if f"<G{self.id}.MU,L" in msg:
+                    self.mixer._reenqueue_inflight_command(seq_num)
+                    break
 
 
 class MixerListener(MixerResponseListener):
@@ -306,9 +512,8 @@ class DCM1Mixer:
         self._source_count: int = 8
         self._group_count: int = 4
 
-        # Retry inflight commands on confirmation failures due to shared serial line interference
+        # Retry inflight commands on confirmation timeout
         self._retry_on_confirmation_timeout: bool = True
-        self._retry_on_confirmation_mismatch: bool = True
         # If connection is down for longer than this, clear inflight commands on reconnect
         # because users may have used the front panel and our commands are now stale
         self._clear_queue_after_reconnection_delay_seconds: float = 60.0
@@ -366,6 +571,7 @@ class DCM1Mixer:
         # Register internal listener to update mixer state
         self._mixer_listener = MixerListener(self)
         self._multiplex_callback.register_listener(self._mixer_listener)
+        self._multiplex_callback.register_listener(self)
         
         # Create protocol instance
         self._protocol = MixerProtocol(self._multiplex_callback)
@@ -479,6 +685,54 @@ class DCM1Mixer:
     def disconnected(self):
         """Called by protocol when connection is lost."""
         self._handle_connection_broken()
+
+    def source_label_received(self, source_id: int, label: str):
+        """No-op listener hook (handled by MixerListener)."""
+        return None
+
+    def zone_label_received(self, zone_id: int, label: str):
+        """No-op listener hook (handled by MixerListener)."""
+        return None
+
+    def zone_line_inputs_received(self, zone_id: int, enabled_inputs: dict[int, bool]):
+        """No-op listener hook (handled by MixerListener)."""
+        return None
+
+    def group_status_received(self, group_id: int, enabled: bool, zones: list[int]):
+        """No-op listener hook (handled by MixerListener)."""
+        return None
+
+    def group_label_received(self, group_id: int, label: str):
+        """No-op listener hook (handled by MixerListener)."""
+        return None
+
+    def group_line_inputs_received(self, group_id: int, enabled_inputs: dict[int, bool]):
+        """No-op listener hook (handled by MixerListener)."""
+        return None
+
+    def zone_source_received(self, zone_id: int, source_id: int):
+        """No-op listener hook (handled by MixerListener)."""
+        return None
+
+    def zone_volume_level_received(self, zone_id: int, level):
+        """No-op listener hook (handled by MixerListener)."""
+        return None
+
+    def group_source_received(self, group_id: int, source_id: int):
+        """No-op listener hook (handled by MixerListener)."""
+        return None
+
+    def group_volume_level_received(self, group_id: int, level):
+        """No-op listener hook (handled by MixerListener)."""
+        return None
+
+    def error(self, error_message: str):
+        """No-op listener hook (handled by MixerListener)."""
+        return None
+
+    def source_change_requested(self, zone_id: int, source_id: int):
+        """No-op listener hook (handled by MixerListener)."""
+        return None
 
     # ========== Public API ==========
 
@@ -605,455 +859,7 @@ class DCM1Mixer:
         if group:
             group.set_volume(level)  # Group validates level
 
-    # ========== Command sending methods ==========
-
-    def send_zone_source(self, source_id: int, zone_id: int):
-        """Set source for a zone with debounce to prevent command collisions."""
-        self._logger.info(
-            f"Source request - Zone: {zone_id} to source: {source_id} (debounced)"
-        )
-        
-        zone = self.zones_by_id.get(zone_id)
-        if not zone:
-            self._logger.error(f"Zone {zone_id} not found")
-            return
-        
-        # Cancel any pending debounce timer for this zone
-        if zone.source_debounce_task and not zone.source_debounce_task.done():
-            zone.source_debounce_task.cancel()
-            self._logger.debug(f"Cancelled pending source command for zone {zone_id}")
-        
-        # Cancel any pending confirmation task for this zone
-        if zone.source_confirm_task and not zone.source_confirm_task.done():
-            zone.source_confirm_task.cancel()
-            self._logger.debug(f"Cancelled pending source confirmation for zone {zone_id}")
-        
-        # Create a new debounce task
-        debounce_task = self._loop.create_task(
-            self._debounce_zone_source_command(zone_id, source_id)
-        )
-        zone.source_debounce_task = debounce_task
-
-    def send_zone_volume_level(self, zone_id: int, level):
-        """Set volume level for a zone with debounce to prevent command collisions."""
-        # Convert level to string format for command
-        if isinstance(level, str):
-            level_str = "62"
-            expected_level = 62
-        else:  # isinstance(level, int) - already validated in set_zone_volume
-            level_str = str(level)
-            expected_level = level
-        
-        self._logger.info(f"Volume request - Zone: {zone_id} to level: {level} (debounced)")
-        
-        zone = self.zones_by_id.get(zone_id)
-        if not zone:
-            self._logger.error(f"Zone {zone_id} not found")
-            return
-        
-        # Cancel any pending debounce timer for this zone
-        if zone.volume_debounce_task and not zone.volume_debounce_task.done():
-            zone.volume_debounce_task.cancel()
-            self._logger.debug(f"Cancelled pending volume command for zone {zone_id}")
-        
-        # Cancel any pending confirmation task for this zone
-        if zone.volume_confirm_task and not zone.volume_confirm_task.done():
-            zone.volume_confirm_task.cancel()
-            self._logger.debug(f"Cancelled pending volume confirmation for zone {zone_id}")
-        
-        # Create a new debounce task
-        debounce_task = self._loop.create_task(
-            self._debounce_zone_volume_command(zone_id, level_str, expected_level)
-        )
-        zone.volume_debounce_task = debounce_task
-
-    def send_group_source(self, source_id: int, group_id: int):
-        """Set a group to use a specific source with debounce."""
-        self._logger.info(
-            f"Source request - Group: {group_id} to source: {source_id} (debounced)"
-        )
-        
-        group = self.groups_by_id.get(group_id)
-        if not group:
-            self._logger.error(f"Group {group_id} not found")
-            return
-        
-        # Cancel any pending debounce timer for this group
-        if group.source_debounce_task and not group.source_debounce_task.done():
-            group.source_debounce_task.cancel()
-            self._logger.debug(f"Cancelled pending source command for group {group_id}")
-        
-        # Cancel any pending confirmation task for this group
-        if group.source_confirm_task and not group.source_confirm_task.done():
-            group.source_confirm_task.cancel()
-            self._logger.debug(f"Cancelled pending source confirmation for group {group_id}")
-        
-        # Create a new debounce task
-        debounce_task = self._loop.create_task(
-            self._debounce_group_source_command(group_id, source_id)
-        )
-        group.source_debounce_task = debounce_task
-
-    def send_group_volume_level(self, group_id: int, level):
-        """Set volume level for a group with debounce."""
-        # Convert level to string format for command
-        if isinstance(level, str):
-            level_str = "62"
-            expected_level = 62
-        else:  # isinstance(level, int) - already validated in set_group_volume
-            level_str = str(level)
-            expected_level = level
-        
-        self._logger.info(f"Volume request - Group: {group_id} to level: {level} (debounced)")
-        
-        group = self.groups_by_id.get(group_id)
-        if not group:
-            self._logger.error(f"Group {group_id} not found")
-            return
-        
-        # Cancel any pending debounce timer for this group
-        if group.volume_debounce_task and not group.volume_debounce_task.done():
-            group.volume_debounce_task.cancel()
-            self._logger.debug(f"Cancelled pending volume command for group {group_id}")
-        
-        # Cancel any pending confirmation task for this group
-        if group.volume_confirm_task and not group.volume_confirm_task.done():
-            group.volume_confirm_task.cancel()
-            self._logger.debug(f"Cancelled pending volume confirmation for group {group_id}")
-        
-        # Create a new debounce task
-        debounce_task = self._loop.create_task(
-            self._debounce_group_volume_command(group_id, level_str, expected_level)
-        )
-        group.volume_debounce_task = debounce_task
-
-    # ========== Debounce tasks ==========
-
-    async def _debounce_zone_source_command(self, zone_id: int, source_id: int):
-        """Wait for debounce delay, then send zone source command if not superseded."""
-        try:
-            await asyncio.sleep(self._volume_debounce_delay)
-            
-            zone = self.zones_by_id.get(zone_id)
-            if not zone:
-                return
-            
-            # Check if this task was cancelled (superseded by newer request)
-            if zone.source_debounce_task != asyncio.current_task():
-                self._logger.debug(f"Source command for zone {zone_id} to source {source_id} was superseded")
-                return
-            
-            # Send the actual command
-            command = f"<Z{zone_id}.MU,S{source_id}/>\r"
-            self._logger.info(f"Queueing debounced source command: {command.encode()}")
-            self._enqueue_command(command)
-            
-            # Auto-confirm if enabled
-            if self._command_confirmation:
-                confirm_task = self._loop.create_task(self._confirm_zone_source(zone_id, source_id))
-                zone.source_confirm_task = confirm_task
-            
-            # Clean up debounce tracker
-            zone.source_debounce_task = None
-        except asyncio.CancelledError:
-            self._logger.debug(f"Debounce task for zone {zone_id} source change was cancelled")
-            zone = self.zones_by_id.get(zone_id)
-            if zone:
-                zone.source_debounce_task = None
-
-    async def _debounce_zone_volume_command(self, zone_id: int, level_str: str, expected_level: int):
-        """Wait for debounce delay, then send zone volume command if not superseded."""
-        try:
-            await asyncio.sleep(self._volume_debounce_delay)
-            
-            zone = self.zones_by_id.get(zone_id)
-            if not zone:
-                return
-            
-            # Check if this task was cancelled (superseded by newer request)
-            if zone.volume_debounce_task != asyncio.current_task():
-                self._logger.debug(f"Volume command for zone {zone_id} level {level_str} was superseded")
-                return
-            
-            # Send the actual command
-            command = f"<Z{zone_id}.MU,L{level_str}/>\r"
-            self._logger.info(f"Queueing debounced volume command: {command.encode()}")
-            self._enqueue_command(command)
-            
-            # Auto-confirm if enabled
-            if self._command_confirmation:
-                confirm_task = self._loop.create_task(self._confirm_zone_volume(zone_id, expected_level))
-                zone.volume_confirm_task = confirm_task
-            
-            # Clean up debounce tracker
-            zone.volume_debounce_task = None
-        except asyncio.CancelledError:
-            self._logger.debug(f"Debounce task for zone {zone_id} was cancelled")
-            zone = self.zones_by_id.get(zone_id)
-            if zone:
-                zone.volume_debounce_task = None
-
-    async def _debounce_group_source_command(self, group_id: int, source_id: int):
-        """Wait for debounce delay, then send group source command if not superseded."""
-        try:
-            await asyncio.sleep(self._volume_debounce_delay)
-            
-            group = self.groups_by_id.get(group_id)
-            if not group:
-                return
-            
-            # Check if this task was cancelled (superseded by newer request)
-            if group.source_debounce_task != asyncio.current_task():
-                self._logger.debug(f"Source command for group {group_id} to source {source_id} was superseded")
-                return
-            
-            # Send the actual command
-            command = f"<G{group_id}.MU,S{source_id}/>\r"
-            self._logger.info(f"Queueing debounced source command: {command.encode()}")
-            self._enqueue_command(command)
-            
-            # Auto-confirm if enabled
-            if self._command_confirmation:
-                confirm_task = self._loop.create_task(self._confirm_group_source(group_id, source_id))
-                group.source_confirm_task = confirm_task
-            
-            # Clean up debounce tracker
-            group.source_debounce_task = None
-        except asyncio.CancelledError:
-            self._logger.debug(f"Debounce task for group {group_id} source change was cancelled")
-            group = self.groups_by_id.get(group_id)
-            if group:
-                group.source_debounce_task = None
-
-    async def _debounce_group_volume_command(self, group_id: int, level_str: str, expected_level: int):
-        """Wait for debounce delay, then send group volume command if not superseded."""
-        try:
-            await asyncio.sleep(self._volume_debounce_delay)
-            
-            group = self.groups_by_id.get(group_id)
-            if not group:
-                return
-            
-            # Check if this task was cancelled (superseded by newer request)
-            if group.volume_debounce_task != asyncio.current_task():
-                self._logger.debug(f"Volume command for group {group_id} level {level_str} was superseded")
-                return
-            
-            # Send the actual command
-            command = f"<G{group_id}.MU,L{level_str}/>\r"
-            self._logger.info(f"Queueing debounced volume command: {command.encode()}")
-            self._enqueue_command(command)
-            
-            # Auto-confirm if enabled
-            if self._command_confirmation:
-                confirm_task = self._loop.create_task(self._confirm_group_volume(group_id, expected_level))
-                group.volume_confirm_task = confirm_task
-            
-            # Clean up debounce tracker
-            group.volume_debounce_task = None
-        except asyncio.CancelledError:
-            self._logger.debug(f"Debounce task for group {group_id} was cancelled")
-            group = self.groups_by_id.get(group_id)
-            if group:
-                group.volume_debounce_task = None
-
-    # ========== Confirmation tasks ==========
-
-    async def _confirm_zone_source(self, zone_id: int, expected_source: int):
-        """Query source after setting to confirm."""
-        await asyncio.sleep(0.3)
-        self._logger.debug(f"Confirming source for zone {zone_id}, expected: {expected_source}")
-        
-        # Query the source
-        self._enqueue_command(f"<Z{zone_id}.MU,SQ/>\r", PRIORITY_READ)
-        
-        await asyncio.sleep(0.5)
-        
-        # Get the inflight command sequence_number for potential retry
-        matching_sequence_number = None
-        for sequence_number in sorted(self._inflight_commands.keys(), reverse=True):
-            _, message = self._inflight_commands[sequence_number]
-            if f"<Z{zone_id}.MU,S" in message:
-                matching_sequence_number = sequence_number
-                break
-        
-        # Check if the source matches expected
-        actual_source = self.get_zone_source(zone_id)
-        if actual_source is None:
-            self._logger.warning(f"Source confirmation: no response received for zone {zone_id}")
-            if self._retry_on_confirmation_timeout and matching_sequence_number is not None:
-                self._reenqueue_inflight_command(matching_sequence_number)
-        elif actual_source != expected_source:
-            self._logger.warning(f"Source mismatch: zone {zone_id} set to {expected_source}, got {actual_source}")
-        else:
-            self._logger.info(f"Source confirmation: zone {zone_id} set to source {actual_source} successfully")
-            self._clear_latest_inflight_command_by_pattern(f"<Z{zone_id}.MU,S")
-
-    async def _confirm_zone_volume(self, zone_id: int, expected_level: int):
-        """Query volume after setting to confirm."""
-        await asyncio.sleep(0.3)
-        self._logger.debug(f"Confirming volume for zone {zone_id}, expected: {expected_level}")
-        
-        # Query the volume level
-        self._enqueue_command(f"<Z{zone_id}.MU,LQ/>\r", PRIORITY_READ)
-        
-        await asyncio.sleep(0.5)
-        
-        # Get the inflight command sequence_number for potential retry
-        matching_sequence_number = None
-        for sequence_number in sorted(self._inflight_commands.keys(), reverse=True):
-            _, message = self._inflight_commands[sequence_number]
-            if f"<Z{zone_id}.MU,L" in message:
-                matching_sequence_number = sequence_number
-                break
-        
-        # Check if the volume matches expected
-        actual_level = self.get_zone_volume_level(zone_id)
-        if actual_level is None:
-            self._logger.warning(f"Volume confirmation: no response received for zone {zone_id}")
-            if self._retry_on_confirmation_timeout and matching_sequence_number is not None:
-                self._reenqueue_inflight_command(matching_sequence_number)
-            return
-
-        # Handle mute cases first
-        if actual_level == "mute":
-            if expected_level == 62:
-                self._logger.info(f"Volume confirmation: zone {zone_id} muted successfully")
-                self._clear_latest_inflight_command_by_pattern(f"<Z{zone_id}.MU,L")
-                return
-            # Retry once if we expected a number but read mute
-            self._logger.debug(
-                f"Volume mismatch (got mute), retrying query once: zone {zone_id} expected {expected_level}"
-            )
-            self._enqueue_command(f"<Z{zone_id}.MU,LQ/>\r", PRIORITY_READ)
-            await asyncio.sleep(0.4)
-            retry_level = self.get_zone_volume_level(zone_id)
-            if retry_level == expected_level:
-                self._logger.info(f"Volume confirmation: zone {zone_id} set to {retry_level} after retry")
-                self._clear_latest_inflight_command_by_pattern(f"<Z{zone_id}.MU,L")
-            else:
-                self._logger.warning(
-                    f"Volume mismatch: zone {zone_id} set to {expected_level}, got {retry_level if retry_level is not None else 'no response'}"
-                )
-            return
-
-        # Numeric levels
-        if isinstance(actual_level, int) and actual_level != expected_level:
-            # Retry once before giving up
-            self._logger.debug(
-                f"Volume mismatch (first read {actual_level}), retrying query once: zone {zone_id} expected {expected_level}"
-            )
-            self._enqueue_command(f"<Z{zone_id}.MU,LQ/>\r", PRIORITY_READ)
-            await asyncio.sleep(0.4)
-            retry_level = self.get_zone_volume_level(zone_id)
-            if retry_level == expected_level:
-                self._logger.info(f"Volume confirmation: zone {zone_id} set to {retry_level} after retry")
-                self._clear_latest_inflight_command_by_pattern(f"<Z{zone_id}.MU,L")
-            else:
-                self._logger.warning(
-                    f"Volume mismatch: zone {zone_id} set to {expected_level}, got {retry_level if retry_level is not None else actual_level}"
-                )
-        else:
-            self._logger.info(f"Volume confirmation: zone {zone_id} set to {actual_level} successfully")
-            self._clear_latest_inflight_command_by_pattern(f"<Z{zone_id}.MU,L")
-
-    async def _confirm_group_source(self, group_id: int, expected_source: int):
-        """Query group source after setting to confirm."""
-        await asyncio.sleep(0.3)
-        self._logger.debug(f"Confirming source for group {group_id}, expected: {expected_source}")
-        
-        # Query the source
-        self._enqueue_command(f"<G{group_id}.MU,SQ/>\r", PRIORITY_READ)
-        
-        await asyncio.sleep(0.5)
-        
-        # Get the inflight command sequence_number for potential retry
-        matching_sequence_number = None
-        for sequence_number in sorted(self._inflight_commands.keys(), reverse=True):
-            _, message = self._inflight_commands[sequence_number]
-            if f"<G{group_id}.MU,S" in message:
-                matching_sequence_number = sequence_number
-                break
-        
-        # Check if the source matches expected
-        actual_source = self.get_group_source(group_id)
-        if actual_source is None:
-            self._logger.warning(f"Source confirmation: no response received for group {group_id}")
-            if self._retry_on_confirmation_timeout and matching_sequence_number is not None:
-                self._reenqueue_inflight_command(matching_sequence_number)
-        elif actual_source != expected_source:
-            self._logger.warning(f"Source mismatch: group {group_id} set to {expected_source}, got {actual_source}")
-        else:
-            self._logger.info(f"Source confirmation: group {group_id} set to source {actual_source} successfully")
-            self._clear_latest_inflight_command_by_pattern(f"<G{group_id}.MU,S")
-
-    async def _confirm_group_volume(self, group_id: int, expected_level: int):
-        """Query group volume after setting to confirm."""
-        await asyncio.sleep(0.3)
-        self._logger.debug(f"Confirming volume for group {group_id}, expected: {expected_level}")
-        
-        # Query the volume level
-        self._enqueue_command(f"<G{group_id}.MU,LQ/>\r", PRIORITY_READ)
-        
-        await asyncio.sleep(0.5)
-        
-        # Get the inflight command sequence_number for potential retry
-        matching_sequence_number = None
-        for sequence_number in sorted(self._inflight_commands.keys(), reverse=True):
-            _, message = self._inflight_commands[sequence_number]
-            if f"<G{group_id}.MU,L" in message:
-                matching_sequence_number = sequence_number
-                break
-        
-        # Check if the volume matches expected
-        actual_level = self.get_group_volume_level(group_id)
-        if actual_level is None:
-            self._logger.warning(f"Volume confirmation: no response received for group {group_id}")
-            if self._retry_on_confirmation_timeout and matching_sequence_number is not None:
-                self._reenqueue_inflight_command(matching_sequence_number)
-            return
-
-        # Handle mute cases first
-        if actual_level == "mute":
-            if expected_level == 62:
-                self._logger.info(f"Volume confirmation: group {group_id} muted successfully")
-                self._clear_latest_inflight_command_by_pattern(f"<G{group_id}.MU,L")
-                return
-            # Retry once if we expected a number but read mute
-            self._logger.debug(
-                f"Volume mismatch (got mute), retrying query once: group {group_id} expected {expected_level}"
-            )
-            self._enqueue_command(f"<G{group_id}.MU,LQ/>\r", PRIORITY_READ)
-            await asyncio.sleep(0.4)
-            retry_level = self.get_group_volume_level(group_id)
-            if retry_level == expected_level:
-                self._logger.info(f"Volume confirmation: group {group_id} set to {retry_level} after retry")
-                self._clear_latest_inflight_command_by_pattern(f"<G{group_id}.MU,L")
-            else:
-                self._logger.warning(
-                    f"Volume mismatch: group {group_id} set to {expected_level}, got {retry_level if retry_level is not None else 'no response'}"
-                )
-            return
-
-        # Numeric levels
-        if isinstance(actual_level, int) and actual_level != expected_level:
-            # Retry once before giving up
-            self._logger.debug(
-                f"Volume mismatch (first read {actual_level}), retrying query once: group {group_id} expected {expected_level}"
-            )
-            self._enqueue_command(f"<G{group_id}.MU,LQ/>\r", PRIORITY_READ)
-            await asyncio.sleep(0.4)
-            retry_level = self.get_group_volume_level(group_id)
-            if retry_level == expected_level:
-                self._logger.info(f"Volume confirmation: group {group_id} set to {retry_level} after retry")
-                self._clear_latest_inflight_command_by_pattern(f"<G{group_id}.MU,L")
-            else:
-                self._logger.warning(
-                    f"Volume mismatch: group {group_id} set to {expected_level}, got {retry_level if retry_level is not None else actual_level}"
-                )
-        else:
-            self._logger.info(f"Volume confirmation: group {group_id} set to {actual_level} successfully")
-            self._clear_latest_inflight_command_by_pattern(f"<G{group_id}.MU,L")
+    # ========== Queue management ==========
 
     # ========== Queue management ==========
 
