@@ -11,7 +11,7 @@ v 0.2 (2026-02-02)
 
 Refector to make vibe coded code more consistant with itself to aid future refector into OOP vs hashses everywhere.
 
-v 0.2 (2026-02-02)
+v 0.2.1 (2026-02-02)
 ------------------
 
 Refeactor to OOP vs all the logic having been slammed into MixerProtocol by AI.
