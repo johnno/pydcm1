@@ -14,7 +14,6 @@ setup(
     long_description=long_descr,
     long_description_content_type='text/markdown',    
     author='johnno',
-    author_email='johnno@example.com',
     url='https://github.com/johnno/pydcm1',
     download_url=f'https://github.com/johnno/pydcm1/archive/{version}.tar.gz',
     keywords=['Cloud', 'DCM1', 'Zone Mixer'],
