@@ -68,6 +68,9 @@ class Output(ABC):
         self._source: Optional[int] = None
         self._volume: Optional[int | str] = None
         self._line_inputs: dict[int, bool] = {}  # Maps line_id to enabled bool
+        self._eq_treble: Optional[int] = None  # EQ treble (-12 to +12)
+        self._eq_mid: Optional[int] = None  # EQ mid (-12 to +12)
+        self._eq_bass: Optional[int] = None  # EQ bass (-12 to +12)
 
         # Control: Debounce and confirmation tasks (private implementation details)
         self._source_debounce_task: Optional[Task[Any]] = None
@@ -125,6 +128,21 @@ class Output(ABC):
     def line_inputs_received(self) -> bool:
         """Whether line inputs have been received from device."""
         return self._line_inputs_received
+
+    @property
+    def eq_treble(self) -> Optional[int]:
+        """EQ treble value (-12 to +12)."""
+        return self._eq_treble
+
+    @property
+    def eq_mid(self) -> Optional[int]:
+        """EQ mid value (-12 to +12)."""
+        return self._eq_mid
+
+    @property
+    def eq_bass(self) -> Optional[int]:
+        """EQ bass value (-12 to +12)."""
+        return self._eq_bass
 
     def all_initial_data_received(self) -> bool:
         """Whether all initial state data has been received for this output."""
@@ -422,6 +440,32 @@ class MixerListener(MixerResponseListener):
         zone = self._mixer.zones_by_id.get(zone_id)
         if zone:
             zone._update_volume_unless_debouncing(level)
+
+    def zone_eq_received(self, zone_id: int, treble: int, mid: int, bass: int):
+        """Track when a zone's EQ values are received from the device."""
+        zone = self._mixer.zones_by_id.get(zone_id)
+        if zone:
+            zone._eq_treble = treble
+            zone._eq_mid = mid
+            zone._eq_bass = bass
+
+    def zone_eq_treble_received(self, zone_id: int, treble: int):
+        """Track when a zone's treble is received from the device."""
+        zone = self._mixer.zones_by_id.get(zone_id)
+        if zone:
+            zone._eq_treble = treble
+
+    def zone_eq_mid_received(self, zone_id: int, mid: int):
+        """Track when a zone's mid is received from the device."""
+        zone = self._mixer.zones_by_id.get(zone_id)
+        if zone:
+            zone._eq_mid = mid
+
+    def zone_eq_bass_received(self, zone_id: int, bass: int):
+        """Track when a zone's bass is received from the device."""
+        zone = self._mixer.zones_by_id.get(zone_id)
+        if zone:
+            zone._eq_bass = bass
 
     def group_label_received(self, group_id: int, label: str):
         """Update the group label when received from device."""
