@@ -68,9 +68,9 @@ class Output(ABC):
         self._source: Optional[int] = None
         self._volume: Optional[int | str] = None
         self._line_inputs: dict[int, bool] = {}  # Maps line_id to enabled bool
-        self._eq_treble: Optional[int] = None  # EQ treble (-12 to +12)
-        self._eq_mid: Optional[int] = None  # EQ mid (-12 to +12)
-        self._eq_bass: Optional[int] = None  # EQ bass (-12 to +12)
+        self._eq_treble: Optional[int] = None  # EQ treble (-14 to +14)
+        self._eq_mid: Optional[int] = None  # EQ mid (-14 to +14)
+        self._eq_bass: Optional[int] = None  # EQ bass (-14 to +14)
 
         # Control: Debounce and confirmation tasks (private implementation details)
         self._source_debounce_task: Optional[Task[Any]] = None
@@ -131,17 +131,17 @@ class Output(ABC):
 
     @property
     def eq_treble(self) -> Optional[int]:
-        """EQ treble value (-12 to +12)."""
+        """EQ treble value (-14 to +14)."""
         return self._eq_treble
 
     @property
     def eq_mid(self) -> Optional[int]:
-        """EQ mid value (-12 to +12)."""
+        """EQ mid value (-14 to +14)."""
         return self._eq_mid
 
     @property
     def eq_bass(self) -> Optional[int]:
-        """EQ bass value (-12 to +12)."""
+        """EQ bass value (-14 to +14)."""
         return self._eq_bass
 
     def all_initial_data_received(self) -> bool:

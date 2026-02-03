@@ -38,8 +38,8 @@ ZONE_SOURCE_RESPONSE = re.compile(r"<z(\d+)\.mu,s=(\d+).*/>.*", re.IGNORECASE)
 # Zone volume level response: <z1.mu,l=20/> or <z1.mu,l=mute/>
 ZONE_VOLUME_LEVEL_RESPONSE = re.compile(r"<z(\d+)\.mu,l=([^/]+)/>", re.IGNORECASE)
 
-# Zone EQ response: <z1.mu,eq, t = 0, m = 0, b = 0/> (treble, mid, bass: -12 to +12)
-ZONE_EQ_RESPONSE = re.compile(r"<z(\d+)\.mu,eq,\s*t\s*=\s*(-?\d+),\s*m\s*=\s*(-?\d+),\s*b\s*=\s*(-?\d+)/>", re.IGNORECASE)
+# Zone EQ response: <z1.mu,eq, t = +14, m = 0, b = -14/> (treble, mid, bass: 0 or -14 to +14)
+ZONE_EQ_RESPONSE = re.compile(r"<z(\d+)\.mu,eq,\s*t\s*=\s*(0|[+-](?:1[0-4]|[1-9])),\s*m\s*=\s*(0|[+-](?:1[0-4]|[1-9])),\s*b\s*=\s*(0|[+-](?:1[0-4]|[1-9]))/>", re.IGNORECASE)
 
 # Group enable status response: <g1,q=1,3d/> or <g1,q=empty/> or <g1,q=2d/>
 # Format: q=<zone_list><d|e> where d=disabled, e=enabled
@@ -208,17 +208,17 @@ class MixerProtocol(asyncio.Protocol):
 
     @staticmethod
     def command_set_zone_eq_treble(zone_id: int, level: int) -> str:
-        """Set zone EQ treble level (-12 to +12)."""
+        """Set zone EQ treble level (-14 to +14)."""
         return f"<Z{zone_id}.MU,T{level}/>\r"
 
     @staticmethod
     def command_set_zone_eq_mid(zone_id: int, level: int) -> str:
-        """Set zone EQ mid level (-12 to +12)."""
+        """Set zone EQ mid level (-14 to +14)."""
         return f"<Z{zone_id}.MU,M{level}/>\r"
 
     @staticmethod
     def command_set_zone_eq_bass(zone_id: int, level: int) -> str:
-        """Set zone EQ bass level (-12 to +12)."""
+        """Set zone EQ bass level (-14 to +14)."""
         return f"<Z{zone_id}.MU,B{level}/>\r"
 
     def _process_received_message(self, message: str):

@@ -67,7 +67,7 @@ class MixerResponseListener(ABC):
         pass
 
     def zone_eq_received(self, zone_id: int, treble: int, mid: int, bass: int):
-        """Called when zone EQ values are received. Values are in range -12 to +12."""
+        """Called when zone EQ values are received. Values are in range -14 to +14."""
         pass
 
 
