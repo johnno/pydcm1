@@ -67,7 +67,19 @@ class MixerResponseListener(ABC):
         pass
 
     def zone_eq_received(self, zone_id: int, treble: int, mid: int, bass: int):
-        """Called when zone EQ values are received. Values are in range -14 to +14."""
+        """Called when zone EQ values are received (combined query response). Values are in range -14 to +14."""
+        pass
+
+    def zone_eq_treble_received(self, zone_id: int, treble: int):
+        """Called when zone EQ treble value is received. Value is in range -14 to +14."""
+        pass
+
+    def zone_eq_mid_received(self, zone_id: int, mid: int):
+        """Called when zone EQ mid value is received. Value is in range -14 to +14."""
+        pass
+
+    def zone_eq_bass_received(self, zone_id: int, bass: int):
+        """Called when zone EQ bass value is received. Value is in range -14 to +14."""
         pass
 
 
@@ -145,6 +157,18 @@ class MultiplexingListener(MixerResponseListener):
         for listener in self._listeners:
             listener.zone_eq_received(zone_id, treble, mid, bass)
 
+    def zone_eq_treble_received(self, zone_id: int, treble: int):
+        for listener in self._listeners:
+            listener.zone_eq_treble_received(zone_id, treble)
+
+    def zone_eq_mid_received(self, zone_id: int, mid: int):
+        for listener in self._listeners:
+            listener.zone_eq_mid_received(zone_id, mid)
+
+    def zone_eq_bass_received(self, zone_id: int, bass: int):
+        for listener in self._listeners:
+            listener.zone_eq_bass_received(zone_id, bass)
+
     def register_listener(self, listener: MixerResponseListener):
         self._listeners.append(listener)
 
@@ -207,4 +231,13 @@ class LoggingListener(MixerResponseListener):
         self.logger.info(f"Group {group_id} source received: {source_id}")
 
     def zone_eq_received(self, zone_id: int, treble: int, mid: int, bass: int):
-        self.logger.info(f"Zone {zone_id} EQ received: treble={treble}, mid={mid}, bass={bass}")
+        self.logger.info(f"Zone {zone_id} EQ combined received: treble={treble:+d}, mid={mid:+d}, bass={bass:+d}")
+
+    def zone_eq_treble_received(self, zone_id: int, treble: int):
+        self.logger.info(f"Zone {zone_id} EQ treble received: {treble:+d}")
+
+    def zone_eq_mid_received(self, zone_id: int, mid: int):
+        self.logger.info(f"Zone {zone_id} EQ mid received: {mid:+d}")
+
+    def zone_eq_bass_received(self, zone_id: int, bass: int):
+        self.logger.info(f"Zone {zone_id} EQ bass received: {bass:+d}")
