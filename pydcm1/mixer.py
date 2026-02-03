@@ -962,7 +962,7 @@ class DCM1Mixer:
             if group._volume_confirm_task and not group._volume_confirm_task.done():
                 group._volume_confirm_task.cancel()
         
-        if hasattr(self, '_connection_watchdog_task') and self._connection_watchdog_task is not None:
+        if self._connection_watchdog_task is not None:
             self._connection_watchdog_task.cancel()
         
         disconnected_message = f"Disconnected from {self._hostname}"
