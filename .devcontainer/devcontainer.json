@@ -1,0 +1,23 @@
+{
+  "name": "pydcm1",
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
+  "postCreateCommand": "python -m pip install --upgrade pip && pip install -r requirements.txt",
+  "postStartCommand": "bash .devcontainer/tailscale.sh",
+  "containerEnv": {
+    "TAILSCALE_AUTHKEY": "${localEnv:TAILSCALE_AUTHKEY}"
+  },
+  "runArgs": [
+    "--cap-add=NET_ADMIN",
+    "--cap-add=NET_RAW",
+    "--device=/dev/net/tun"
+  ],
+  "customizations": {
+    "vscode": {
+      "settings": {
+        "python.defaultInterpreterPath": "/usr/local/bin/python"
+      }
+    }
+  }
+}
