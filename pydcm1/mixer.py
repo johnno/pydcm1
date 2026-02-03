@@ -127,6 +127,15 @@ class Output(ABC):
         """Whether line inputs have been received from device."""
         return self._line_inputs_received
 
+    def all_initial_data_received(self) -> bool:
+        """Whether all initial state data has been received for this output."""
+        return (
+            self.label_received
+            and self.line_inputs_received
+            and self.volume_received
+            and self.source_received
+        )
+
     def _update_volume_unless_debouncing(self, value: Optional[int | str]):
         """Update volume from device only if not currently debouncing. Ignores stale responses."""
         if self._volume_debounce_task and not self._volume_debounce_task.done():
@@ -349,6 +358,10 @@ class Group(Output):
     def status_received(self) -> bool:
         """Whether group status has been received from device."""
         return self._status_received
+
+    def all_initial_data_received(self) -> bool:
+        """Whether all initial state data has been received for this group."""
+        return super().all_initial_data_received() and self.status_received
 
 
 
@@ -1167,8 +1180,7 @@ class DCM1Mixer:
             all_received = True
             for zid in expected_zone_ids:
                 zone = self.zones_by_id[zid]
-                if not (zone.label_received and zone.line_inputs_received and 
-                        zone.volume_received and zone.source_received):
+                if not zone.all_initial_data_received():
                     all_received = False
                     break
             if all_received:
@@ -1197,9 +1209,7 @@ class DCM1Mixer:
             all_received = True
             for gid in expected_group_ids:
                 group = self.groups_by_id[gid]
-                if not (group.label_received and group.status_received and
-                        group.volume_received and group.line_inputs_received and
-                        group.source_received):
+                if not group.all_initial_data_received():
                     all_received = False
                     break
             if all_received:
