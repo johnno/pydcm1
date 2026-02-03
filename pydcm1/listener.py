@@ -6,6 +6,10 @@ import logging
 
 class MixerResponseListener(ABC):
 
+    def data_received(self, data: bytes):
+        """Called when raw data is received from the transport."""
+        pass
+
     def connected(self):
         pass
 
@@ -92,6 +96,10 @@ class MultiplexingListener(MixerResponseListener):
     def connected(self):
         for listener in self._listeners:
             listener.connected()
+
+    def data_received(self, data: bytes):
+        for listener in self._listeners:
+            listener.data_received(data)
 
     def disconnected(self):
         for listener in self._listeners:

@@ -122,6 +122,7 @@ class MixerProtocol(asyncio.Protocol):
     def data_received(self, data):
         """Called when data is received from transport."""
         self._logger.debug(f"data_received: {data}")
+        self._listener.data_received(data)
         
         # DCM1 sometimes sends multiple complete responses in one packet
         # Each response is of the format <.../>

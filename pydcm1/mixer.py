@@ -604,6 +604,10 @@ class MixerListener(MixerResponseListener):
 
     def __init__(self, mixer):
         self._mixer = mixer
+
+    def data_received(self, data: bytes):
+        """Update last-receive timestamp on any inbound data."""
+        self._mixer._last_receive_timestamp = time.time()
     
     def connected(self):
         """Forward connection event to mixer."""
