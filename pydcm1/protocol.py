@@ -41,11 +41,6 @@ ZONE_VOLUME_LEVEL_RESPONSE = re.compile(r"<z(\d+)\.mu,l=([^/]+)/>", re.IGNORECAS
 # Zone EQ response: <z1.mu,eq, t = 0, m = 0, b = 0/> (treble, mid, bass: -12 to +12)
 ZONE_EQ_RESPONSE = re.compile(r"<z(\d+)\.mu,eq,\s*t\s*=\s*(-?\d+),\s*m\s*=\s*(-?\d+),\s*b\s*=\s*(-?\d+)/>", re.IGNORECASE)
 
-# Individual EQ component responses: <z4.mu,t=0/>, <z4.mu,m=0/>, <z4.mu,b=0/>
-ZONE_EQ_TREBLE_RESPONSE = re.compile(r"<z(\d+)\.mu,t=(-?\d+)/>", re.IGNORECASE)
-ZONE_EQ_MID_RESPONSE = re.compile(r"<z(\d+)\.mu,m=(-?\d+)/>", re.IGNORECASE)
-ZONE_EQ_BASS_RESPONSE = re.compile(r"<z(\d+)\.mu,b=(-?\d+)/>", re.IGNORECASE)
-
 # Group enable status response: <g1,q=1,3d/> or <g1,q=empty/> or <g1,q=2d/>
 # Format: q=<zone_list><d|e> where d=disabled, e=enabled
 # "empty" means no zones assigned and disabled
@@ -275,31 +270,6 @@ class MixerProtocol(asyncio.Protocol):
             mid = int(zone_eq_match.group(3))
             bass = int(zone_eq_match.group(4))
             self._listener.zone_eq_received(zone_id, treble, mid, bass)
-            return
-        
-        # Individual EQ component responses
-        zone_treble_match = ZONE_EQ_TREBLE_RESPONSE.match(message)
-        if zone_treble_match:
-            self._logger.info(f"RECV: Zone treble response: {message}")
-            zone_id = int(zone_treble_match.group(1))
-            treble = int(zone_treble_match.group(2))
-            self._listener.zone_eq_treble_received(zone_id, treble)
-            return
-        
-        zone_mid_match = ZONE_EQ_MID_RESPONSE.match(message)
-        if zone_mid_match:
-            self._logger.info(f"RECV: Zone mid response: {message}")
-            zone_id = int(zone_mid_match.group(1))
-            mid = int(zone_mid_match.group(2))
-            self._listener.zone_eq_mid_received(zone_id, mid)
-            return
-        
-        zone_bass_match = ZONE_EQ_BASS_RESPONSE.match(message)
-        if zone_bass_match:
-            self._logger.info(f"RECV: Zone bass response: {message}")
-            zone_id = int(zone_bass_match.group(1))
-            bass = int(zone_bass_match.group(2))
-            self._listener.zone_eq_bass_received(zone_id, bass)
             return
         
         # Group source response: <g1.mu,s=7/>

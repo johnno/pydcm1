@@ -449,24 +449,6 @@ class MixerListener(MixerResponseListener):
             zone._eq_mid = mid
             zone._eq_bass = bass
 
-    def zone_eq_treble_received(self, zone_id: int, treble: int):
-        """Track when a zone's treble is received from the device."""
-        zone = self._mixer.zones_by_id.get(zone_id)
-        if zone:
-            zone._eq_treble = treble
-
-    def zone_eq_mid_received(self, zone_id: int, mid: int):
-        """Track when a zone's mid is received from the device."""
-        zone = self._mixer.zones_by_id.get(zone_id)
-        if zone:
-            zone._eq_mid = mid
-
-    def zone_eq_bass_received(self, zone_id: int, bass: int):
-        """Track when a zone's bass is received from the device."""
-        zone = self._mixer.zones_by_id.get(zone_id)
-        if zone:
-            zone._eq_bass = bass
-
     def group_label_received(self, group_id: int, label: str):
         """Update the group label when received from device."""
         group = self._mixer.groups_by_id.get(group_id)
