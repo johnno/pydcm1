@@ -157,6 +157,16 @@ class MixerProtocol(asyncio.Protocol):
         return f"<{output_type.value}{output_id}.MU,L"
 
     @staticmethod
+    def command_source_target_id(output_type: OutputType, message: str) -> Optional[int]:
+        match = re.search(rf"<{output_type.value}(\d+)\.MU,S", message, re.IGNORECASE)
+        return int(match.group(1)) if match else None
+
+    @staticmethod
+    def command_volume_target_id(output_type: OutputType, message: str) -> Optional[int]:
+        match = re.search(rf"<{output_type.value}(\d+)\.MU,L", message, re.IGNORECASE)
+        return int(match.group(1)) if match else None
+
+    @staticmethod
     def command_set_source(output_type: OutputType, output_id: int, source_id: int) -> str:
         return f"<{output_type.value}{output_id}.MU,S{source_id}/>\r"
 

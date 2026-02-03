@@ -14,7 +14,6 @@ This class implements MixerResponseListener to receive callbacks from the transp
 
 import asyncio
 import logging
-import re
 import time
 from abc import ABC, abstractmethod
 from asyncio import PriorityQueue, Task
@@ -1017,23 +1016,19 @@ class DCM1Mixer:
     def _debounce_inflight_commands(self, sequence_number: int, message: str):
         """Remove older inflight commands for the same zone/group AND command type."""
         # Extract zone/group and command type
-        zone_vol_match = re.search(r'<Z(\d+)\.MU,L', message)
-        zone_src_match = re.search(r'<Z(\d+)\.MU,S', message)
-        group_vol_match = re.search(r'<G(\d+)\.MU,L', message)
-        group_src_match = re.search(r'<G(\d+)\.MU,S', message)
+        zone_vol_id = MixerProtocol.command_volume_target_id(OutputType.ZONE, message)
+        zone_src_id = MixerProtocol.command_source_target_id(OutputType.ZONE, message)
+        group_vol_id = MixerProtocol.command_volume_target_id(OutputType.GROUP, message)
+        group_src_id = MixerProtocol.command_source_target_id(OutputType.GROUP, message)
         
-        if zone_src_match:
-            zone_id = zone_src_match.group(1)
-            pattern = MixerProtocol.command_source_pattern(OutputType.ZONE, int(zone_id))
-        elif zone_vol_match:
-            zone_id = zone_vol_match.group(1)
-            pattern = MixerProtocol.command_volume_pattern(OutputType.ZONE, int(zone_id))
-        elif group_src_match:
-            group_id = group_src_match.group(1)
-            pattern = MixerProtocol.command_source_pattern(OutputType.GROUP, int(group_id))
-        elif group_vol_match:
-            group_id = group_vol_match.group(1)
-            pattern = MixerProtocol.command_volume_pattern(OutputType.GROUP, int(group_id))
+        if zone_src_id is not None:
+            pattern = MixerProtocol.command_source_pattern(OutputType.ZONE, zone_src_id)
+        elif zone_vol_id is not None:
+            pattern = MixerProtocol.command_volume_pattern(OutputType.ZONE, zone_vol_id)
+        elif group_src_id is not None:
+            pattern = MixerProtocol.command_source_pattern(OutputType.GROUP, group_src_id)
+        elif group_vol_id is not None:
+            pattern = MixerProtocol.command_volume_pattern(OutputType.GROUP, group_vol_id)
         else:
             return
         
