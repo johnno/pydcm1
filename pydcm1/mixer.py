@@ -655,12 +655,18 @@ class MixerListener(MixerResponseListener):
         zone = self._mixer.zones_by_id.get(zone_id)
         if zone:
             zone._update_source_unless_debouncing(source_id)
+        self._mixer._clear_pending_heartbeat_query(
+            MixerProtocol.command_query_source(OutputType.ZONE, zone_id)
+        )
 
     def zone_volume_level_received(self, zone_id: int, level):
         """Track when a zone's volume is received from the device."""
         zone = self._mixer.zones_by_id.get(zone_id)
         if zone:
             zone._update_volume_unless_debouncing(level)
+        self._mixer._clear_pending_heartbeat_query(
+            MixerProtocol.command_query_volume(OutputType.ZONE, zone_id)
+        )
 
     def zone_eq_received(self, zone_id: int, treble: int, mid: int, bass: int):
         """Track when a zone's EQ values are received from the device (combined query response)."""
@@ -715,6 +721,9 @@ class MixerListener(MixerResponseListener):
         group = self._mixer.groups_by_id.get(group_id)
         if group:
             group._update_volume_unless_debouncing(level)
+        self._mixer._clear_pending_heartbeat_query(
+            MixerProtocol.command_query_volume(OutputType.GROUP, group_id)
+        )
     
     def group_line_inputs_received(self, group_id: int, line_inputs: dict[int, bool]):
         """Track when a group's line input data is received."""
@@ -728,6 +737,9 @@ class MixerListener(MixerResponseListener):
         group = self._mixer.groups_by_id.get(group_id)
         if group:
             group._update_source_unless_debouncing(source_id)
+        self._mixer._clear_pending_heartbeat_query(
+            MixerProtocol.command_query_source(OutputType.GROUP, group_id)
+        )
 
 
 class DCM1Mixer:
@@ -931,6 +943,7 @@ class DCM1Mixer:
         self._command_worker_task = self._loop.create_task(self._command_worker())
         if self._enable_heartbeat:
             self._heartbeat_task = self._loop.create_task(self._heartbeat())
+            self._logger.info("Heartbeat task started (interval=%ss)", self._heartbeat_time)
         
         # Start connection watchdog to detect silent disconnections
         self._connection_watchdog_task = self._loop.create_task(self._connection_watchdog())
@@ -1121,6 +1134,11 @@ class DCM1Mixer:
         except asyncio.QueueFull:
             self._logger.error("Command queue is full, dropping command")
 
+    def _clear_pending_heartbeat_query(self, query: str) -> None:
+        """Clear a pending heartbeat query after its response is received."""
+        if query in self._pending_heartbeat_queries:
+            self._pending_heartbeat_queries.remove(query)
+
     async def _command_worker(self):
         """Worker task that processes all outgoing commands from the priority queue."""
         while True:
@@ -1175,7 +1193,6 @@ class DCM1Mixer:
         """Periodically query zone and group status to sync with physical panel changes."""
         while True:
             await asyncio.sleep(self._heartbeat_time)
-            self._logger.debug(f"heartbeat - polling status for {self._zone_count} zones and {self._group_count} groups")
             
             # Query source and volume for all zones
             for zone_id in range(1, self._zone_count + 1):
@@ -1222,7 +1239,6 @@ class DCM1Mixer:
                 
                 if self._connected:
                     elapsed_seconds_since_data_last_received = time.time() - self._last_receive_timestamp
-                    
                     if elapsed_seconds_since_data_last_received > idle_timeout_seconds:
                         self._logger.error(
                             f"[WATCHDOG FALLBACK] Connection appears dead: no data received for {elapsed_seconds_since_data_last_received:.1f}s, reconnecting..."
