@@ -339,6 +339,165 @@ class Zone(Output):
 
     def __init__(self, zone_id: int, name: str, mixer: 'DCM1Mixer' = None):
         super().__init__(zone_id, name, mixer=mixer)
+        # EQ debounce and confirmation task
+        self._eq_debounce_task: Optional[Task[Any]] = None
+        self._eq_confirm_task: Optional[Task[Any]] = None
+
+    def _validate_eq_level(self, level: int) -> bool:
+        """Validate EQ level is in range (0 or -14 to +14)."""
+        return level == 0 or (-14 <= level <= 14 and level != 0)
+
+    def set_eq(self, treble: int, mid: int, bass: int):
+        """Set all EQ values (treble, mid, bass) for this zone with debounce and confirmation.
+        
+        Args:
+            treble: Treble level (0 or -14 to +14)
+            mid: Mid level (0 or -14 to +14)
+            bass: Bass level (0 or -14 to +14)
+        """
+        if not self._mixer:
+            raise RuntimeError(f"Zone {self._id} has no mixer reference")
+        
+        if not (self._validate_eq_level(treble) and
+                self._validate_eq_level(mid) and
+                self._validate_eq_level(bass)):
+            self._mixer._logger.error(
+                f"Invalid EQ levels for Zone {self._id}: T={treble}, M={mid}, B={bass} (must be 0 or -14 to +14)"
+            )
+            return
+        
+        self._mixer._logger.info(
+            f"EQ request - Zone: {self._id} to T:{treble:+d} M:{mid:+d} B:{bass:+d} (debounced)"
+        )
+        
+        # Cancel any pending debounce/confirm tasks
+        if self._eq_debounce_task and not self._eq_debounce_task.done():
+            self._eq_debounce_task.cancel()
+        if self._eq_confirm_task and not self._eq_confirm_task.done():
+            self._eq_confirm_task.cancel()
+        
+        # Create debounce task
+        self._eq_debounce_task = self._mixer._loop.create_task(
+            self._debounce_eq(treble, mid, bass)
+        )
+
+    async def _debounce_eq(self, treble: int, mid: int, bass: int):
+        """Debounce and send EQ command."""
+        try:
+            await asyncio.sleep(self._mixer._volume_debounce_delay)
+            if self._eq_debounce_task != asyncio.current_task():
+                return
+            command = MixerProtocol.command_set_zone_eq(self._id, treble, mid, bass)
+            self._mixer._enqueue_command(command)
+            if self._mixer._command_confirmation:
+                self._eq_confirm_task = self._mixer._loop.create_task(
+                    self._confirm_eq(treble, mid, bass)
+                )
+            self._eq_debounce_task = None
+        except asyncio.CancelledError:
+            self._eq_debounce_task = None
+
+    async def _confirm_eq(self, expected_treble: int, expected_mid: int, expected_bass: int):
+        """Confirm EQ was set correctly."""
+        await asyncio.sleep(0.3)
+        self._mixer._enqueue_command(
+            MixerProtocol.command_query_zone_eq(self._id),
+            PRIORITY_READ,
+        )
+        await asyncio.sleep(0.5)
+
+        if (self.eq_treble != expected_treble or 
+            self.eq_mid != expected_mid or 
+            self.eq_bass != expected_bass):
+            # Retry query once
+            self._mixer._enqueue_command(
+                MixerProtocol.command_query_zone_eq(self._id),
+                PRIORITY_READ,
+            )
+            await asyncio.sleep(0.4)
+
+        if (self.eq_treble == expected_treble and 
+            self.eq_mid == expected_mid and 
+            self.eq_bass == expected_bass):
+            self._mixer._clear_latest_inflight_command_by_pattern(
+                f"<Z{self._id}.MU,T"
+            )
+        else:
+            # Find and retry inflight command
+            for seq_num in sorted(self._mixer._inflight_commands.keys(), reverse=True):
+                _, msg = self._mixer._inflight_commands[seq_num]
+                if f"<Z{self._id}.MU,T" in msg:
+                    self._mixer._reenqueue_inflight_command(seq_num)
+                    break
+
+    def set_eq_treble(self, level: int):
+        """Set EQ treble level for this zone.
+        
+        Requires that mid and bass levels are already known from device.
+        
+        Args:
+            level: Treble level (0 or -14 to +14)
+        """
+        if not self._mixer:
+            raise RuntimeError(f"Zone {self._id} has no mixer reference")
+        
+        if self._eq_mid is None or self._eq_bass is None:
+            self._mixer._logger.error(
+                f"Cannot set treble for Zone {self._id}: mid ({self._eq_mid}) or bass ({self._eq_bass}) not known"
+            )
+            return
+        
+        if not self._validate_eq_level(level):
+            self._mixer._logger.error(f"Invalid treble level {level}")
+            return
+        
+        self.set_eq(level, self._eq_mid, self._eq_bass)
+
+    def set_eq_mid(self, level: int):
+        """Set EQ mid level for this zone.
+        
+        Requires that treble and bass levels are already known from device.
+        
+        Args:
+            level: Mid level (0 or -14 to +14)
+        """
+        if not self._mixer:
+            raise RuntimeError(f"Zone {self._id} has no mixer reference")
+        
+        if self._eq_treble is None or self._eq_bass is None:
+            self._mixer._logger.error(
+                f"Cannot set mid for Zone {self._id}: treble ({self._eq_treble}) or bass ({self._eq_bass}) not known"
+            )
+            return
+        
+        if not self._validate_eq_level(level):
+            self._mixer._logger.error(f"Invalid mid level {level}")
+            return
+        
+        self.set_eq(self._eq_treble, level, self._eq_bass)
+
+    def set_eq_bass(self, level: int):
+        """Set EQ bass level for this zone.
+        
+        Requires that treble and mid levels are already known from device.
+        
+        Args:
+            level: Bass level (0 or -14 to +14)
+        """
+        if not self._mixer:
+            raise RuntimeError(f"Zone {self._id} has no mixer reference")
+        
+        if self._eq_treble is None or self._eq_mid is None:
+            self._mixer._logger.error(
+                f"Cannot set bass for Zone {self._id}: treble ({self._eq_treble}) or mid ({self._eq_mid}) not known"
+            )
+            return
+        
+        if not self._validate_eq_level(level):
+            self._mixer._logger.error(f"Invalid bass level {level}")
+            return
+        
+        self.set_eq(self._eq_treble, self._eq_mid, level)
 
 
 class Group(Output):
@@ -631,12 +790,18 @@ class DCM1Mixer:
                     if zone._volume_debounce_task and not zone._volume_debounce_task.done():
                         zone._volume_debounce_task.cancel()
                     zone._volume_debounce_task = None
+                    if zone._eq_debounce_task and not zone._eq_debounce_task.done():
+                        zone._eq_debounce_task.cancel()
+                    zone._eq_debounce_task = None
                     if zone._source_confirm_task and not zone._source_confirm_task.done():
                         zone._source_confirm_task.cancel()
                     zone._source_confirm_task = None
                     if zone._volume_confirm_task and not zone._volume_confirm_task.done():
                         zone._volume_confirm_task.cancel()
                     zone._volume_confirm_task = None
+                    if zone._eq_confirm_task and not zone._eq_confirm_task.done():
+                        zone._eq_confirm_task.cancel()
+                    zone._eq_confirm_task = None
                 
                 # Cancel and clear all mid-flight debounce/confirm tasks in groups
                 for group in self.groups_by_id.values():
@@ -788,6 +953,30 @@ class DCM1Mixer:
         zone = self._get_zone_by_id(zone_id)
         if zone:
             zone.set_volume(level)  # Zone validates level
+
+    def set_zone_eq(self, zone_id: int, treble: int, mid: int, bass: int):
+        """Set EQ levels for a zone."""
+        zone = self._get_zone_by_id(zone_id)
+        if zone:
+            zone.set_eq(treble, mid, bass)  # Zone validates levels
+
+    def set_zone_eq_treble(self, zone_id: int, level: int):
+        """Set EQ treble level for a zone."""
+        zone = self._get_zone_by_id(zone_id)
+        if zone:
+            zone.set_eq_treble(level)  # Zone validates level and requires mid/bass known
+
+    def set_zone_eq_mid(self, zone_id: int, level: int):
+        """Set EQ mid level for a zone."""
+        zone = self._get_zone_by_id(zone_id)
+        if zone:
+            zone.set_eq_mid(level)  # Zone validates level and requires treble/bass known
+
+    def set_zone_eq_bass(self, zone_id: int, level: int):
+        """Set EQ bass level for a zone."""
+        zone = self._get_zone_by_id(zone_id)
+        if zone:
+            zone.set_eq_bass(level)  # Zone validates level and requires treble/mid known
 
     def set_group_source(self, group_id: int, source_id: int):
         """Set a group to use a specific source."""
@@ -982,6 +1171,8 @@ class DCM1Mixer:
                 zone._source_confirm_task.cancel()
             if zone._volume_confirm_task and not zone._volume_confirm_task.done():
                 zone._volume_confirm_task.cancel()
+            if zone._eq_confirm_task and not zone._eq_confirm_task.done():
+                zone._eq_confirm_task.cancel()
         
         for group in self.groups_by_id.values():
             if group._source_confirm_task and not group._source_confirm_task.done():

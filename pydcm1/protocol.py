@@ -202,24 +202,14 @@ class MixerProtocol(asyncio.Protocol):
         return f"<L{source_id},LQ/>\r"
 
     @staticmethod
+    def command_set_zone_eq(zone_id: int, treble: int, mid: int, bass: int) -> str:
+        """Set zone EQ (treble, mid, bass) all at once (-14 to +14 for each)."""
+        return f"<Z{zone_id}.MU,T{treble},M{mid},B{bass}/>\r"
+
+    @staticmethod
     def command_query_zone_eq(zone_id: int) -> str:
         """Query zone EQ settings (treble, mid, bass)."""
         return f"<Z{zone_id}.MU,EQ/>\r"
-
-    @staticmethod
-    def command_set_zone_eq_treble(zone_id: int, level: int) -> str:
-        """Set zone EQ treble level (-14 to +14)."""
-        return f"<Z{zone_id}.MU,T{level}/>\r"
-
-    @staticmethod
-    def command_set_zone_eq_mid(zone_id: int, level: int) -> str:
-        """Set zone EQ mid level (-14 to +14)."""
-        return f"<Z{zone_id}.MU,M{level}/>\r"
-
-    @staticmethod
-    def command_set_zone_eq_bass(zone_id: int, level: int) -> str:
-        """Set zone EQ bass level (-14 to +14)."""
-        return f"<Z{zone_id}.MU,B{level}/>\r"
 
     def _process_received_message(self, message: str):
         """Parse received message and fire appropriate listener callback.
