@@ -258,11 +258,10 @@ class MixerProtocol(asyncio.Protocol):
             self._logger.info(f"RECV: Zone source response: {message}")
             zone_id = int(zone_source_match.group(1))
             source_id = int(zone_source_match.group(2))
-            # Source ID 0 means no source is active, don't process it
-            if source_id > 0:
-                self._process_zone_source_received(source_id, zone_id)
-            else:
+            # Source ID 0 means no source is active, but it is still a valid state
+            if source_id == 0:
                 self._logger.debug(f"Zone {zone_id} has no active source")
+            self._process_zone_source_received(source_id, zone_id)
             return
 
         # Zone volume level response: <z1.mu,l=20/> or <z1.mu,l=mute/>
@@ -325,11 +324,10 @@ class MixerProtocol(asyncio.Protocol):
             self._logger.info(f"RECV: Group source response: {message}")
             group_id = int(group_source_match.group(1))
             source_id = int(group_source_match.group(2))
-            # Source ID 0 means no source is active, don't process it
-            if source_id > 0:
-                self._process_group_source_received(source_id, group_id)
-            else:
+            # Source ID 0 means no source is active, but it is still a valid state
+            if source_id == 0:
                 self._logger.debug(f"Group {group_id} has no active source")
+            self._process_group_source_received(source_id, group_id)
             return
 
         # Group volume level response

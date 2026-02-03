@@ -347,6 +347,14 @@ class Zone(Output):
         self._eq_bass_debounce_task: Optional[Task[Any]] = None
         self._eq_bass_confirm_task: Optional[Task[Any]] = None
 
+        # Tracking: Which attributes have been received from device
+        self._eq_received: bool = False
+
+    @property
+    def eq_received(self) -> bool:
+        """Whether EQ status has been received from device."""
+        return self._eq_received
+
     def _validate_eq_level(self, level: int) -> bool:
         """Validate EQ level is in range (0 or even values -14 to +14)."""
         return level == 0 or (-14 <= level <= 14 and level % 2 == 0)
@@ -545,6 +553,10 @@ class Zone(Output):
             MixerProtocol.command_eq_bass_pattern(self._id)
         )
 
+    def all_initial_data_received(self) -> bool:
+        """Whether all initial state data has been received for this zone."""
+        return super().all_initial_data_received() and self._eq_received
+
 
 class Group(Output):
     """Represents a group in the DCM1 mixer with state and control tracking."""
@@ -653,6 +665,7 @@ class MixerListener(MixerResponseListener):
             zone._eq_treble = treble
             zone._eq_mid = mid
             zone._eq_bass = bass
+            zone._eq_received = True
 
     def zone_eq_treble_received(self, zone_id: int, treble: int):
         """Track when a zone's EQ treble value is received from the device."""
@@ -1494,6 +1507,8 @@ class DCM1Mixer:
         missing_line_inputs = {zid for zid in expected_zone_ids if not self.zones_by_id[zid].line_inputs_received}
         missing_volumes = {zid for zid in expected_zone_ids if not self.zones_by_id[zid].volume_received}
         missing_sources = {zid for zid in expected_zone_ids if not self.zones_by_id[zid].source_received}
+        missing_eqs = {zid for zid in expected_zone_ids if not self.zones_by_id[zid].eq_received}
+
         if missing_labels:
             print(f"Warning: Timeout waiting for zone labels: {missing_labels}")
         if missing_line_inputs:
@@ -1502,6 +1517,8 @@ class DCM1Mixer:
             print(f"Warning: Timeout waiting for zone volumes: {missing_volumes}")
         if missing_sources:
             print(f"Warning: Timeout waiting for zone sources: {missing_sources}")
+        if missing_eqs:
+            print(f"Warning: Timeout waiting for zone eqs: {missing_eqs}")
         return False
 
     async def wait_for_group_data(self, timeout: float = 10.0):
