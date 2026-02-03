@@ -38,8 +38,15 @@ ZONE_SOURCE_RESPONSE = re.compile(r"<z(\d+)\.mu,s=(\d+).*/>.*", re.IGNORECASE)
 # Zone volume level response: <z1.mu,l=20/> or <z1.mu,l=mute/>
 ZONE_VOLUME_LEVEL_RESPONSE = re.compile(r"<z(\d+)\.mu,l=([^/]+)/>", re.IGNORECASE)
 
-# Zone EQ response: <z1.mu,eq, t = +14, m = 0, b = -14/> (treble, mid, bass: 0 or -14 to +14)
-ZONE_EQ_RESPONSE = re.compile(r"<z(\d+)\.mu,eq,\s*t\s*=\s*(0|[+-](?:1[0-4]|[1-9])),\s*m\s*=\s*(0|[+-](?:1[0-4]|[1-9])),\s*b\s*=\s*(0|[+-](?:1[0-4]|[1-9]))/>", re.IGNORECASE)
+# Zone EQ individual responses: <z8.mu,t=+14/>, <z8.mu,m=0/>, <z8.mu,b=-14/>
+# Only even values allowed: 0, ±2, ±4, ±6, ±8, ±10, ±12, ±14
+ZONE_EQ_TREBLE_RESPONSE = re.compile(r"<z(\d+)\.mu,t\s*=\s*(0|[+-](?:14|12|10|8|6|4|2))/>", re.IGNORECASE)
+ZONE_EQ_MID_RESPONSE = re.compile(r"<z(\d+)\.mu,m\s*=\s*(0|[+-](?:14|12|10|8|6|4|2))/>", re.IGNORECASE)
+ZONE_EQ_BASS_RESPONSE = re.compile(r"<z(\d+)\.mu,b\s*=\s*(0|[+-](?:14|12|10|8|6|4|2))/>", re.IGNORECASE)
+
+# Zone EQ combined query response: <z1.mu,eq, t = +14, m = 0, b = -14/>
+# Only even values allowed: 0, ±2, ±4, ±6, ±8, ±10, ±12, ±14
+ZONE_EQ_RESPONSE = re.compile(r"<z(\d+)\.mu,eq,\s*t\s*=\s*(0|[+-](?:14|12|10|8|6|4|2)),\s*m\s*=\s*(0|[+-](?:14|12|10|8|6|4|2)),\s*b\s*=\s*(0|[+-](?:14|12|10|8|6|4|2))/>", re.IGNORECASE)
 
 # Group enable status response: <g1,q=1,3d/> or <g1,q=empty/> or <g1,q=2d/>
 # Format: q=<zone_list><d|e> where d=disabled, e=enabled
@@ -160,6 +167,18 @@ class MixerProtocol(asyncio.Protocol):
         return f"<{output_type.value}{output_id}.MU,L"
 
     @staticmethod
+    def command_eq_treble_pattern(zone_id: int) -> str:
+        return f"<Z{zone_id}.MU,T"
+
+    @staticmethod
+    def command_eq_mid_pattern(zone_id: int) -> str:
+        return f"<Z{zone_id}.MU,M"
+
+    @staticmethod
+    def command_eq_bass_pattern(zone_id: int) -> str:
+        return f"<Z{zone_id}.MU,B"
+
+    @staticmethod
     def command_source_target_id(output_type: OutputType, message: str) -> Optional[int]:
         match = re.search(rf"<{output_type.value}(\d+)\.MU,S", message, re.IGNORECASE)
         return int(match.group(1)) if match else None
@@ -202,9 +221,22 @@ class MixerProtocol(asyncio.Protocol):
         return f"<L{source_id},LQ/>\r"
 
     @staticmethod
-    def command_set_zone_eq(zone_id: int, treble: int, mid: int, bass: int) -> str:
-        """Set zone EQ (treble, mid, bass) all at once (-14 to +14 for each)."""
-        return f"<Z{zone_id}.MU,T{treble},M{mid},B{bass}/>\r"
+    def command_set_zone_eq_treble(zone_id: int, level: int) -> str:
+        """Set zone EQ treble level (0 or even values -14 to +14)."""
+        sign = f"{level:+d}" if level != 0 else "0"
+        return f"<Z{zone_id}.MU,T{sign}/>\r"
+
+    @staticmethod
+    def command_set_zone_eq_mid(zone_id: int, level: int) -> str:
+        """Set zone EQ mid level (0 or even values -14 to +14)."""
+        sign = f"{level:+d}" if level != 0 else "0"
+        return f"<Z{zone_id}.MU,M{sign}/>\r"
+
+    @staticmethod
+    def command_set_zone_eq_bass(zone_id: int, level: int) -> str:
+        """Set zone EQ bass level (0 or even values -14 to +14)."""
+        sign = f"{level:+d}" if level != 0 else "0"
+        return f"<Z{zone_id}.MU,B{sign}/>\r"
 
     @staticmethod
     def command_query_zone_eq(zone_id: int) -> str:
@@ -251,10 +283,35 @@ class MixerProtocol(asyncio.Protocol):
             self._listener.zone_volume_level_received(zone_id, level)
             return
         
-        # Zone EQ response: <z1.mu,eq, t = 0, m = 0, b = 0/>
+        # Zone EQ individual responses: <z8.mu,t=+14/>, <z8.mu,m=0/>, <z8.mu,b=-14/>
+        zone_eq_treble_match = ZONE_EQ_TREBLE_RESPONSE.match(message)
+        if zone_eq_treble_match:
+            self._logger.info(f"RECV: Zone EQ treble response: {message}")
+            zone_id = int(zone_eq_treble_match.group(1))
+            treble = int(zone_eq_treble_match.group(2))
+            self._listener.zone_eq_treble_received(zone_id, treble)
+            return
+
+        zone_eq_mid_match = ZONE_EQ_MID_RESPONSE.match(message)
+        if zone_eq_mid_match:
+            self._logger.info(f"RECV: Zone EQ mid response: {message}")
+            zone_id = int(zone_eq_mid_match.group(1))
+            mid = int(zone_eq_mid_match.group(2))
+            self._listener.zone_eq_mid_received(zone_id, mid)
+            return
+
+        zone_eq_bass_match = ZONE_EQ_BASS_RESPONSE.match(message)
+        if zone_eq_bass_match:
+            self._logger.info(f"RECV: Zone EQ bass response: {message}")
+            zone_id = int(zone_eq_bass_match.group(1))
+            bass = int(zone_eq_bass_match.group(2))
+            self._listener.zone_eq_bass_received(zone_id, bass)
+            return
+        
+        # Zone EQ combined query response: <z1.mu,eq, t = 0, m = 0, b = 0/>
         zone_eq_match = ZONE_EQ_RESPONSE.match(message)
         if zone_eq_match:
-            self._logger.info(f"RECV: Zone EQ response: {message}")
+            self._logger.info(f"RECV: Zone EQ combined response: {message}")
             zone_id = int(zone_eq_match.group(1))
             treble = int(zone_eq_match.group(2))
             mid = int(zone_eq_match.group(3))
