@@ -26,7 +26,7 @@ async def show_status(hostname: str, port: int):
         await asyncio.sleep(0.1)
     
     print("\nZone Status:")
-    print("-" * 100)
+    print("-" * 120)
     
     for zone_id in sorted(mixer.zones_by_id.keys()):
         zone = mixer.zones_by_id[zone_id]
@@ -50,20 +50,30 @@ async def show_status(hostname: str, port: int):
         else:
             inputs_str = "querying..."
 
+        # Format EQ display
+        eq_parts = []
+        if zone.eq_treble is not None:
+            eq_parts.append(f"T:{zone.eq_treble:+d}")
+        if zone.eq_mid is not None:
+            eq_parts.append(f"M:{zone.eq_mid:+d}")
+        if zone.eq_bass is not None:
+            eq_parts.append(f"B:{zone.eq_bass:+d}")
+        eq_str = " ".join(eq_parts) if eq_parts else "unknown"
+
         if source_id:
             source = mixer.sources_by_id.get(source_id)
             source_name = source.name if source else f"Source {source_id}"
             zone_label = f"Zone {zone_id} ({zone.name}):"
-            print(f"{zone_label:30s} {source_id} - {source_name:20s} | Vol: {volume_str:10s} | Inputs: {inputs_str}")
+            print(f"{zone_label:30s} {source_id} - {source_name:20s} | Vol: {volume_str:10s} | EQ: {eq_str:15s} | Inputs: {inputs_str}")
         else:
             zone_label = f"Zone {zone_id} ({zone.name}):"
-            print(f"{zone_label:30s} {'OFF':24s} | Vol: {volume_str:10s} | Inputs: {inputs_str}")
+            print(f"{zone_label:30s} {'OFF':24s} | Vol: {volume_str:10s} | EQ: {eq_str:15s} | Inputs: {inputs_str}")
     
-    print("-" * 100)
+    print("-" * 120)
     
     # Display groups
     print("\nGroup Status:")
-    print("-" * 100)
+    print("-" * 120)
     
     for group_id in sorted(mixer.groups_by_id.keys()):
         group = mixer.groups_by_id[group_id]
@@ -91,7 +101,7 @@ async def show_status(hostname: str, port: int):
         group_label = f"Group {group_id} ({group.name}):"
         print(f"{group_label:30s} [{status:8s}] | Vol: {volume_str:10s} | Zones: {zones_str:10s} | Inputs: {inputs_str}")
     
-    print("-" * 100)
+    print("-" * 120)
     
     mixer.close()
 

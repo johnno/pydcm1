@@ -688,6 +688,7 @@ class DCM1Mixer:
         # Query operational status
         self._enqueue_zone_source_query_commands()
         self._enqueue_zone_volume_level_query_commands()
+        self._enqueue_zone_eq_query_commands()
         self._enqueue_group_source_query_commands()
         self._enqueue_group_volume_level_query_commands()
 
@@ -1105,6 +1106,15 @@ class DCM1Mixer:
                 PRIORITY_READ,
             )
 
+    def _enqueue_zone_eq_query_commands(self):
+        """Query EQ settings for all zones."""
+        self._logger.info("Querying zone EQ settings")
+        for zone_id in range(1, self._zone_count + 1):
+            self._enqueue_command(
+                MixerProtocol.command_query_zone_eq(zone_id),
+                PRIORITY_READ,
+            )
+
     def _enqueue_zone_line_input_enable_query_commands(self):
         """Query which line inputs are enabled for all zones (1-8)."""
         self._logger.info("Querying line input enables for all zones")
@@ -1172,6 +1182,7 @@ class DCM1Mixer:
         self._enqueue_zone_source_query_commands()
         self._enqueue_zone_line_input_enable_query_commands()
         self._enqueue_zone_volume_level_query_commands()
+        self._enqueue_zone_eq_query_commands()
         # Query all groups
         self._enqueue_group_status_query_commands()
         self._enqueue_group_label_query_commands()
