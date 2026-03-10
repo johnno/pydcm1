@@ -245,19 +245,19 @@ class MixerProtocol(asyncio.Protocol):
         return f"<Z{zone_id}.MU,EQ/>\r"
 
     @staticmethod
-    def command_paging_open(zone_id: int) -> str:
-        """Open (activate) paging for a specific zone.
+    def command_paging_open(zones_mask: str) -> str:
+        """Open (activate) paging for specific zones using an 8-character mask.
 
-        Sends the PA (Paging Activate) command for the given zone number.
-        e.g. zone_id=1 -> '<PM,PA1/>'
+        Sends the PA (Paging Activate) command with an 8-char mask of 'X' and 'O'.
+        e.g. zones_mask='XOOOOOOO' -> '<PM,PAXOOOOOOO/>' for zone 1.
 
         This is a fire-and-forget command; the DCM1 does not send a
         distinctive response acknowledgement for paging commands.
 
         Args:
-            zone_id: Zone number (1-8)
+            zones_mask: 8-character string of 'X' (on) and 'O' (off)
         """
-        return f"<PM,PA{zone_id}/>\r"
+        return f"<PM,PA{zones_mask}/>\r"
 
     @staticmethod
     def command_paging_close_all() -> str:

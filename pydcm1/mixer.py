@@ -1099,7 +1099,7 @@ class DCM1Mixer:
     def start_zone_paging(self, zone_id: int) -> None:
         """Open (activate) paging on a specific zone.
 
-        Sends '<PM,PA{zone_id}/>' immediately at write priority.
+        Sends '<PM,PAXXXXXXXX/>' with a mask for the specific zone.
         Fire-and-forget — the DCM1 does not send a confirmation.
 
         Args:
@@ -1110,16 +1110,23 @@ class DCM1Mixer:
                 f"Invalid zone_id {zone_id} for paging, must be 1-{self._zone_count}"
             )
             return
-        self._logger.info(f"Opening paging on zone {zone_id}")
+        
+        # Create 8-char mask 'OOOOOOOO' and set 'X' at the zone_id position
+        mask_list = ["O"] * self._zone_count
+        mask_list[zone_id - 1] = "X"
+        mask = "".join(mask_list)
+
+        self._logger.info(f"Opening paging on zone {zone_id} (mask: {mask})")
         self._enqueue_command(
-            MixerProtocol.command_paging_open(zone_id), PRIORITY_WRITE
+            MixerProtocol.command_paging_open(mask), PRIORITY_WRITE
         )
 
     def start_group_paging(self, group_id: int) -> None:
         """Open paging on all zones that are members of a group.
 
-        The DCM1 has no native group-level paging concept, so this fans out
-        a '<PM,PA{zone_id}/>' command for every zone in the group.
+        The DCM1 has no native group-level paging concept, so this sends
+        a single '<PM,PAXXXXXXXX/>' command with a combined mask for all
+        zones in the group.
 
         Args:
             group_id: Group number (1-4)
@@ -1132,13 +1139,18 @@ class DCM1Mixer:
                 f"Group {group_id} has no member zones — paging not sent"
             )
             return
-        self._logger.info(
-            f"Opening paging for group {group_id} on member zones: {group.zones}"
-        )
+
+        # Create 8-char mask 'OOOOOOOO' and set 'X' for each zone in the group
+        mask_list = ["O"] * self._zone_count
         for zone_id in group.zones:
-            self._enqueue_command(
-                MixerProtocol.command_paging_open(zone_id), PRIORITY_WRITE
-            )
+            if 1 <= zone_id <= self._zone_count:
+                mask_list[zone_id - 1] = "X"
+        
+        mask = "".join(mask_list)
+        self._logger.info(f"Opening paging on group {group_id} (mask: {mask})")
+        self._enqueue_command(
+            MixerProtocol.command_paging_open(mask), PRIORITY_WRITE
+        )
 
     def stop_all_paging(self) -> None:
         """Switch all paging off (Paging Release).

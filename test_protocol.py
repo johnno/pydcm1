@@ -12,12 +12,12 @@ from pydcm1.protocol import MixerProtocol
 
 def test_command_paging_open_zone1():
     """Zone 1 paging open should produce the correct wire format."""
-    assert MixerProtocol.command_paging_open(1) == "<PM,PA1/>\r"
+    assert MixerProtocol.command_paging_open("XOOOOOOO") == "<PM,PAXOOOOOOO/>\r"
 
 
 def test_command_paging_open_zone8():
     """Zone 8 paging open should produce the correct wire format."""
-    assert MixerProtocol.command_paging_open(8) == "<PM,PA8/>\r"
+    assert MixerProtocol.command_paging_open("OOOOOOOX") == "<PM,PAOOOOOOOX/>\r"
 
 
 def test_command_paging_close_all():
