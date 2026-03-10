@@ -1096,6 +1096,61 @@ class DCM1Mixer:
         if group:
             group.set_volume(level)  # Group validates level
 
+    def start_zone_paging(self, zone_id: int) -> None:
+        """Open (activate) paging on a specific zone.
+
+        Sends '<PM,PA{zone_id}/>' immediately at write priority.
+        Fire-and-forget — the DCM1 does not send a confirmation.
+
+        Args:
+            zone_id: Zone number (1-8)
+        """
+        if not (1 <= zone_id <= self._zone_count):
+            self._logger.error(
+                f"Invalid zone_id {zone_id} for paging, must be 1-{self._zone_count}"
+            )
+            return
+        self._logger.info(f"Opening paging on zone {zone_id}")
+        self._enqueue_command(
+            MixerProtocol.command_paging_open(zone_id), PRIORITY_WRITE
+        )
+
+    def start_group_paging(self, group_id: int) -> None:
+        """Open paging on all zones that are members of a group.
+
+        The DCM1 has no native group-level paging concept, so this fans out
+        a '<PM,PA{zone_id}/>' command for every zone in the group.
+
+        Args:
+            group_id: Group number (1-4)
+        """
+        group = self._get_group_by_id(group_id)
+        if not group:
+            return
+        if not group.zones:
+            self._logger.warning(
+                f"Group {group_id} has no member zones — paging not sent"
+            )
+            return
+        self._logger.info(
+            f"Opening paging for group {group_id} on member zones: {group.zones}"
+        )
+        for zone_id in group.zones:
+            self._enqueue_command(
+                MixerProtocol.command_paging_open(zone_id), PRIORITY_WRITE
+            )
+
+    def stop_all_paging(self) -> None:
+        """Switch all paging off (Paging Release).
+
+        Sends '<PM,PR/>' immediately at write priority.
+        Fire-and-forget — the DCM1 does not send a confirmation.
+        """
+        self._logger.info("Stopping all paging")
+        self._enqueue_command(
+            MixerProtocol.command_paging_close_all(), PRIORITY_WRITE
+        )
+
     # ========== Helpers  ==========
 
     def _get_zone_by_id(self, zone_id: int) -> Optional[Zone]:

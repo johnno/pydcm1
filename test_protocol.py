@@ -1,15 +1,38 @@
 """
-Test protocol implementation for Cloud DCM1 Zone Mixer.
-
-This module will contain tests for the DCM1 protocol implementation.
+Tests for the DCM1 protocol command builders.
 """
 
-# TODO: Implement tests once the API protocol is defined
+import pytest
+from pydcm1.protocol import MixerProtocol
+
+
+# ---------------------------------------------------------------------------
+# Paging command builder tests
+# ---------------------------------------------------------------------------
+
+def test_command_paging_open_zone1():
+    """Zone 1 paging open should produce the correct wire format."""
+    assert MixerProtocol.command_paging_open(1) == "<PM,PA1/>\r"
+
+
+def test_command_paging_open_zone8():
+    """Zone 8 paging open should produce the correct wire format."""
+    assert MixerProtocol.command_paging_open(8) == "<PM,PA8/>\r"
+
+
+def test_command_paging_close_all():
+    """Paging release (close all) should produce the correct wire format."""
+    assert MixerProtocol.command_paging_close_all() == "<PM,PR/>\r"
+
+
+# ---------------------------------------------------------------------------
+# Existing placeholder (kept for CI stability)
+# ---------------------------------------------------------------------------
 
 def test_placeholder():
-    """Placeholder test."""
+    """Placeholder — ensures the test suite always has at least one passing test."""
     assert True
 
+
 if __name__ == "__main__":
-    test_placeholder()
-    print("Tests will be implemented once the DCM1 protocol is defined")
+    pytest.main([__file__, "-v"])

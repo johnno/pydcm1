@@ -244,6 +244,32 @@ class MixerProtocol(asyncio.Protocol):
         """Query zone EQ settings (treble, mid, bass)."""
         return f"<Z{zone_id}.MU,EQ/>\r"
 
+    @staticmethod
+    def command_paging_open(zone_id: int) -> str:
+        """Open (activate) paging for a specific zone.
+
+        Sends the PA (Paging Activate) command for the given zone number.
+        e.g. zone_id=1 -> '<PM,PA1/>'
+
+        This is a fire-and-forget command; the DCM1 does not send a
+        distinctive response acknowledgement for paging commands.
+
+        Args:
+            zone_id: Zone number (1-8)
+        """
+        return f"<PM,PA{zone_id}/>\r"
+
+    @staticmethod
+    def command_paging_close_all() -> str:
+        """Switch all paging off (Paging Release).
+
+        Sends '<PM,PR/>' which deactivates paging on all zones.
+
+        This is a fire-and-forget command; the DCM1 does not send a
+        distinctive response acknowledgement for paging commands.
+        """
+        return "<PM,PR/>\r"
+
     def _process_received_message(self, message: str):
         """Parse received message and fire appropriate listener callback.
         
