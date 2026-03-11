@@ -68,6 +68,11 @@ GROUP_SOURCE_RESPONSE = re.compile(r"<g(\d+)\.mu,s=(\d+)/>", re.IGNORECASE)
 GROUP_VOLUME_LEVEL_RESPONSE = re.compile(r"<g(\d+)\.mu,l=([^/]+)/>", re.IGNORECASE)
 
 
+# Paging status response: <pm,p=OOOOOOOX/> or <pm,p=0/>
+# Note: The device sometimes responds with <pm,p=0/> when all zones are released
+PAGING_STATUS_RESPONSE = re.compile(r"<pm,p=([^/]+)/>", re.IGNORECASE)
+
+
 class OutputType(str, Enum):
     ZONE = "Z"
     GROUP = "G"
@@ -180,6 +185,10 @@ class MixerProtocol(asyncio.Protocol):
         return f"<Z{zone_id}.MU,B"
 
     @staticmethod
+    def command_paging_pattern() -> str:
+        return "<PM,P"
+
+    @staticmethod
     def command_source_target_id(output_type: OutputType, message: str) -> Optional[int]:
         match = re.search(rf"<{output_type.value}(\d+)\.MU,S", message, re.IGNORECASE)
         return int(match.group(1)) if match else None
@@ -251,9 +260,6 @@ class MixerProtocol(asyncio.Protocol):
         Sends the PA (Paging Activate) command with an 8-char mask of 'X' and 'O'.
         e.g. zones_mask='XOOOOOOO' -> '<PM,PAXOOOOOOO/>' for zone 1.
 
-        This is a fire-and-forget command; the DCM1 does not send a
-        distinctive response acknowledgement for paging commands.
-
         Args:
             zones_mask: 8-character string of 'X' (on) and 'O' (off)
         """
@@ -264,11 +270,17 @@ class MixerProtocol(asyncio.Protocol):
         """Switch all paging off (Paging Release).
 
         Sends '<PM,PR/>' which deactivates paging on all zones.
-
-        This is a fire-and-forget command; the DCM1 does not send a
-        distinctive response acknowledgement for paging commands.
         """
         return "<PM,PR/>\r"
+
+    @staticmethod
+    def command_query_paging_status() -> str:
+        """Query current paging status.
+
+        Sends '<PM,PQ/>' and device responds with '<pm,p=OOOOOOOO/>' (all off)
+        or '<pm,p=XOOOOOOO/>' etc.
+        """
+        return "<PM,PQ/>\r"
 
     def _process_received_message(self, message: str):
         """Parse received message and fire appropriate listener callback.
@@ -474,6 +486,17 @@ class MixerProtocol(asyncio.Protocol):
                 self._listener.group_line_inputs_received(
                     group_id, self._group_line_inputs_map[group_id].copy()
                 )
+            return
+
+        # Paging status response: <pm,p=OOOOOOOX/>
+        paging_status_match = PAGING_STATUS_RESPONSE.match(message)
+        if paging_status_match:
+            self._logger.info(f"RECV: Paging status response: {message}")
+            mask = paging_status_match.group(1)
+            # Normalize '0' to 'OOOOOOOO'
+            if mask == "0":
+                mask = "OOOOOOOO"
+            self._listener.paging_status_received(mask)
             return
                 
         # System info response

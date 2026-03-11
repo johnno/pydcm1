@@ -87,6 +87,15 @@ class MixerResponseListener(ABC):
         pass
 
 
+    def paging_status_received(self, mask: str):
+        """Called when paging status (mask) is received.
+        
+        Args:
+            mask: 8-character string of 'X' (paging on) and 'O' (paging off)
+        """
+        pass
+
+
 class MultiplexingListener(MixerResponseListener):
     _listeners: List[MixerResponseListener]
 
@@ -177,6 +186,10 @@ class MultiplexingListener(MixerResponseListener):
         for listener in self._listeners:
             listener.zone_eq_bass_received(zone_id, bass)
 
+    def paging_status_received(self, mask: str):
+        for listener in self._listeners:
+            listener.paging_status_received(mask)
+
     def register_listener(self, listener: MixerResponseListener):
         self._listeners.append(listener)
 
@@ -249,3 +262,6 @@ class LoggingListener(MixerResponseListener):
 
     def zone_eq_bass_received(self, zone_id: int, bass: int):
         self.logger.info(f"Zone {zone_id} EQ bass received: {bass:+d}")
+
+    def paging_status_received(self, mask: str):
+        self.logger.info(f"Paging status received (mask): {mask}")
