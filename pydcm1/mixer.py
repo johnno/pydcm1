@@ -1211,6 +1211,25 @@ class DCM1Mixer:
         self._logger.info(f"Opening paging on group {group_id} (mask: {mask})")
         await self._async_paging_open(mask)
 
+    async def start_paging_with_mask(self, mask: str) -> None:
+        """Open paging on an arbitrary combination of zones.
+
+        Args:
+            mask: 8-character string of 'X' (active) and 'O' (inactive),
+                  e.g. 'XOXOOOOO' opens zones 1 and 3.
+        """
+        mask = mask.upper()
+        if len(mask) != self._zone_count or not all(c in "XO" for c in mask):
+            self._logger.error(
+                f"Invalid paging mask '{mask}': must be {self._zone_count} X/O characters"
+            )
+            return
+        if "X" not in mask:
+            self._logger.error("Paging mask has no active zones — ignoring")
+            return
+        self._logger.info(f"Opening paging with mask: {mask}")
+        await self._async_paging_open(mask)
+
     async def stop_all_paging(self) -> None:
         """Switch all paging off (Paging Release).
 
