@@ -1256,6 +1256,15 @@ class DCM1Mixer:
         self._enqueue_command(MixerProtocol.command_query_paging_status(), PRIORITY_READ)
         await asyncio.sleep(0.5)
 
+        # TODO: Unlike volume/source, a paging mask mismatch after confirmation is ambiguous:
+        # it could be a genuine send failure (command lost → retry is correct), or it could
+        # mean another source (physical mic, SD card) has opened the bus (→ retrying would
+        # override an active external page, which is wrong).  To distinguish these cases we
+        # would need a timestamp of when _paging_status was last updated so we can tell
+        # whether the query response we just read arrived *after* our command was sent (real
+        # failure) or was already stale before we even sent (pre-existing external page).
+        # Until that timestamp is available, retrying on mismatch is the status quo but may
+        # stomp on legitimate external paging activity.
         if self._paging_status != expected_mask:
             for seq_num in sorted(self._inflight_commands.keys(), reverse=True):
                 _, msg = self._inflight_commands[seq_num]
