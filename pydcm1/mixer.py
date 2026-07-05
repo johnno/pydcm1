@@ -991,13 +991,20 @@ class DCM1Mixer:
         # Start connection watchdog to detect silent disconnections
         self._connection_watchdog_task = self._loop.create_task(self._connection_watchdog())
         
-        # Query configuration
-        self._enqueue_source_label_query_commands()
-        self._enqueue_zone_label_query_commands()
-        self._enqueue_zone_line_input_enable_query_commands()
-        self._enqueue_group_status_query_commands()
-        self._enqueue_group_label_query_commands()
-        self._enqueue_group_line_input_enable_query_commands()
+        # Query configuration — only on initial connect.
+        # On reconnect, skip these to preserve cached labels/line inputs; if the device
+        # is slow to respond it may return empty/default values and overwrite good names.
+        if not lost_timestamp:
+            self._enqueue_source_label_query_commands()
+            self._enqueue_zone_label_query_commands()
+            self._enqueue_zone_line_input_enable_query_commands()
+            self._enqueue_group_status_query_commands()
+            self._enqueue_group_label_query_commands()
+            self._enqueue_group_line_input_enable_query_commands()
+        else:
+            self._logger.info(
+                "Reconnect: skipping installation config queries, retaining cached labels and line inputs"
+            )
 
         # Query operational status
         self._enqueue_zone_source_query_commands()
