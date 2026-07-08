@@ -155,7 +155,7 @@ class Output(ABC):
 
     def _update_volume_unless_debouncing(self, value: Optional[int | str]):
         """Update volume from device only if not currently debouncing. Ignores stale responses."""
-        if self._volume_debounce_task and not self._volume_debounce_task.done():
+        if (task := self._volume_debounce_task) and not task.done():
             if self._mixer:
                 self._mixer._logger.debug(
                     f"Ignoring stale volume response for {self._type_name} {self._id} while command is debouncing"
@@ -167,7 +167,7 @@ class Output(ABC):
 
     def _update_source_unless_debouncing(self, value: Optional[int]):
         """Update source from device only if not currently debouncing. Ignores stale responses."""
-        if self._source_debounce_task and not self._source_debounce_task.done():
+        if (task := self._source_debounce_task) and not task.done():
             if self._mixer:
                 self._mixer._logger.debug(
                     f"Ignoring stale source response for {self._type_name} {self._id} while command is debouncing"
@@ -196,11 +196,13 @@ class Output(ABC):
             f"Source request - {self._type_name}: {self._id} to source: {source_id} (debounced)"
         )
 
-        # Cancel any pending debounce/confirm tasks
-        if self._source_debounce_task and not self._source_debounce_task.done():
-            self._source_debounce_task.cancel()
-        if self._source_confirm_task and not self._source_confirm_task.done():
-            self._source_confirm_task.cancel()
+        # Cancel any pending debounce tasks
+        if (task := self._source_debounce_task) and not task.done():
+            task.cancel()
+            self._source_debounce_task = None
+        if (task := self._source_confirm_task) and not task.done():
+            task.cancel()
+            self._source_confirm_task = None
 
         # Create debounce task
         self._source_debounce_task = self._mixer._loop.create_task(
@@ -276,10 +278,12 @@ class Output(ABC):
         )
 
         # Cancel any pending debounce/confirm tasks
-        if self._volume_debounce_task and not self._volume_debounce_task.done():
-            self._volume_debounce_task.cancel()
-        if self._volume_confirm_task and not self._volume_confirm_task.done():
-            self._volume_confirm_task.cancel()
+        if (task := self._volume_debounce_task) and not task.done():
+            task.cancel()
+            self._volume_debounce_task = None
+        if (task := self._volume_confirm_task) and not task.done():
+            task.cancel()
+            self._volume_confirm_task = None
 
         # Create debounce task
         self._volume_debounce_task = self._mixer._loop.create_task(
@@ -403,10 +407,12 @@ class Zone(Output):
         self._mixer._logger.info(f"EQ Treble request - Zone: {self._id} to {level:+d} (debounced)")
         
         # Cancel any pending debounce/confirm tasks
-        if self._eq_treble_debounce_task and not self._eq_treble_debounce_task.done():
-            self._eq_treble_debounce_task.cancel()
-        if self._eq_treble_confirm_task and not self._eq_treble_confirm_task.done():
-            self._eq_treble_confirm_task.cancel()
+        if (task := self._eq_treble_debounce_task) and not task.done():
+            task.cancel()
+            self._eq_treble_debounce_task = None
+        if (task := self._eq_treble_confirm_task) and not task.done():
+            task.cancel()
+            self._eq_treble_confirm_task = None
         
         # Create debounce task
         self._eq_treble_debounce_task = self._mixer._loop.create_task(
@@ -459,10 +465,12 @@ class Zone(Output):
         self._mixer._logger.info(f"EQ Mid request - Zone: {self._id} to {level:+d} (debounced)")
         
         # Cancel any pending debounce/confirm tasks
-        if self._eq_mid_debounce_task and not self._eq_mid_debounce_task.done():
-            self._eq_mid_debounce_task.cancel()
-        if self._eq_mid_confirm_task and not self._eq_mid_confirm_task.done():
-            self._eq_mid_confirm_task.cancel()
+        if (task := self._eq_mid_debounce_task) and not task.done():
+            task.cancel()
+            self._eq_mid_debounce_task = None
+        if (task := self._eq_mid_confirm_task) and not task.done():
+            task.cancel()
+            self._eq_mid_confirm_task = None
         
         # Create debounce task
         self._eq_mid_debounce_task = self._mixer._loop.create_task(
@@ -515,10 +523,12 @@ class Zone(Output):
         self._mixer._logger.info(f"EQ Bass request - Zone: {self._id} to {level:+d} (debounced)")
         
         # Cancel any pending debounce/confirm tasks
-        if self._eq_bass_debounce_task and not self._eq_bass_debounce_task.done():
-            self._eq_bass_debounce_task.cancel()
-        if self._eq_bass_confirm_task and not self._eq_bass_confirm_task.done():
-            self._eq_bass_confirm_task.cancel()
+        if (task := self._eq_bass_debounce_task) and not task.done():
+            task.cancel()
+            self._eq_bass_debounce_task = None
+        if (task := self._eq_bass_confirm_task) and not task.done():
+            task.cancel()
+            self._eq_bass_confirm_task = None
         
         # Create debounce task
         self._eq_bass_debounce_task = self._mixer._loop.create_task(
@@ -630,6 +640,14 @@ class MixerListener(MixerResponseListener):
             source._label_received = True
             self._mixer.sources_by_name[label] = source
     
+    def paging_status_received(self, mask: str):
+        """Update paging status state when received from device."""
+        self._mixer._paging_status = mask
+        self._mixer._logger.info(f"Paging status received: {mask}")
+        self._mixer._clear_pending_heartbeat_query(
+            MixerProtocol.command_query_paging_status()
+        )
+
     def zone_label_received(self, zone_id: int, label: str):
         """Update the zone label when received from device."""
         zone = self._mixer.zones_by_id.get(zone_id)
@@ -828,6 +846,13 @@ class DCM1Mixer:
         # Track pending heartbeat queries to prevent duplicate polling
         self._pending_heartbeat_queries = set()
 
+        # Paging state - Stored as a single string mask like "00000000"
+        # where each char is '0' or 'X' representing paging status of each zone.
+        # Read from left to right, so "X0000000" means zone 1 is paging,
+        # "0X000000" means zone 2 is paging, etc.
+        self._paging_status: Optional[str] = None
+        self._paging_confirm_task: Optional[Task[Any]] = None
+
         # Track user commands that have been sent but not yet confirmed (inflight)
         # Format: command_sequence_number -> (priority, message)
         self._inflight_commands: dict[int, tuple[int, str]] = {}
@@ -853,18 +878,19 @@ class DCM1Mixer:
         self._last_receive_timestamp = time.time()
         
         # Cancel any existing tasks before creating new ones
-        if self._command_worker_task is not None and not self._command_worker_task.done():
-            self._command_worker_task.cancel()
-        if self._heartbeat_task is not None and not self._heartbeat_task.done():
-            self._heartbeat_task.cancel()
+        if (task := self._command_worker_task) and not task.done():
+            task.cancel()
+            self._command_worker_task = None
+        if (task := self._heartbeat_task) and not task.done():
+            task.cancel()
+            self._heartbeat_task = None
         
-        # Check if connection was down for a long time
         reenqueue_inflight_commands = True
-        if self._connection_lost_timestamp is not None:
+        if (lost_timestamp := self._connection_lost_timestamp):
             # Clear pending heartbeat queries since the device won't respond to stale requests
             self._pending_heartbeat_queries.clear()
 
-            downtime_duration_seconds = time.time() - self._connection_lost_timestamp
+            downtime_duration_seconds = time.time() - lost_timestamp
             if downtime_duration_seconds > self._clear_queue_after_reconnection_delay_seconds:
                 reenqueue_inflight_commands = False
 
@@ -877,52 +903,69 @@ class DCM1Mixer:
                 
                 # Cancel and clear all mid-flight debounce/confirm tasks in zones
                 for zone in self.zones_by_id.values():
-                    if zone._source_debounce_task and not zone._source_debounce_task.done():
-                        zone._source_debounce_task.cancel()
+                    if (task := zone._source_debounce_task) and not task.done():
+                        task.cancel()
                     zone._source_debounce_task = None
-                    if zone._volume_debounce_task and not zone._volume_debounce_task.done():
-                        zone._volume_debounce_task.cancel()
+
+                    if (task := zone._volume_debounce_task) and not task.done():
+                        task.cancel()
                     zone._volume_debounce_task = None
-                    if zone._eq_treble_debounce_task and not zone._eq_treble_debounce_task.done():
-                        zone._eq_treble_debounce_task.cancel()
+
+                    if (task := zone._eq_treble_debounce_task) and not task.done():
+                        task.cancel()
                     zone._eq_treble_debounce_task = None
-                    if zone._eq_mid_debounce_task and not zone._eq_mid_debounce_task.done():
-                        zone._eq_mid_debounce_task.cancel()
+
+                    if (task := zone._eq_mid_debounce_task) and not task.done():
+                        task.cancel()
                     zone._eq_mid_debounce_task = None
-                    if zone._eq_bass_debounce_task and not zone._eq_bass_debounce_task.done():
-                        zone._eq_bass_debounce_task.cancel()
+
+                    if (task := zone._eq_bass_debounce_task) and not task.done():
+                        task.cancel()
                     zone._eq_bass_debounce_task = None
-                    if zone._source_confirm_task and not zone._source_confirm_task.done():
-                        zone._source_confirm_task.cancel()
+
+                    if (task := zone._source_confirm_task) and not task.done():
+                        task.cancel()
                     zone._source_confirm_task = None
-                    if zone._volume_confirm_task and not zone._volume_confirm_task.done():
-                        zone._volume_confirm_task.cancel()
+
+                    if (task := zone._volume_confirm_task) and not task.done():
+                        task.cancel()
                     zone._volume_confirm_task = None
-                    if zone._eq_treble_confirm_task and not zone._eq_treble_confirm_task.done():
-                        zone._eq_treble_confirm_task.cancel()
+
+                    if (task := zone._eq_treble_confirm_task) and not task.done():
+                        task.cancel()
                     zone._eq_treble_confirm_task = None
-                    if zone._eq_mid_confirm_task and not zone._eq_mid_confirm_task.done():
-                        zone._eq_mid_confirm_task.cancel()
+
+                    if (task := zone._eq_mid_confirm_task) and not task.done():
+                        task.cancel()
                     zone._eq_mid_confirm_task = None
-                    if zone._eq_bass_confirm_task and not zone._eq_bass_confirm_task.done():
-                        zone._eq_bass_confirm_task.cancel()
+
+                    if (task := zone._eq_bass_confirm_task) and not task.done():
+                        task.cancel()
                     zone._eq_bass_confirm_task = None
                 
                 # Cancel and clear all mid-flight debounce/confirm tasks in groups
                 for group in self.groups_by_id.values():
-                    if group._source_debounce_task and not group._source_debounce_task.done():
-                        group._source_debounce_task.cancel()
+                    if (task := group._source_debounce_task) and not task.done():
+                        task.cancel()
                     group._source_debounce_task = None
-                    if group._volume_debounce_task and not group._volume_debounce_task.done():
-                        group._volume_debounce_task.cancel()
+
+                    if (task := group._volume_debounce_task) and not task.done():
+                        task.cancel()
                     group._volume_debounce_task = None
-                    if group._source_confirm_task and not group._source_confirm_task.done():
-                        group._source_confirm_task.cancel()
+
+                    if (task := group._source_confirm_task) and not task.done():
+                        task.cancel()
                     group._source_confirm_task = None
-                    if group._volume_confirm_task and not group._volume_confirm_task.done():
-                        group._volume_confirm_task.cancel()
+
+                    if (task := group._volume_confirm_task) and not task.done():
+                        task.cancel()
                     group._volume_confirm_task = None
                                 
+                # Cancel paging confirmation if pending
+                if (task := self._paging_confirm_task) and not task.done():
+                    task.cancel()
+                self._paging_confirm_task = None
+
             self._connection_lost_timestamp = None
         
         # Re-queue any inflight user commands that were sent but not confirmed before disconnect
@@ -948,13 +991,20 @@ class DCM1Mixer:
         # Start connection watchdog to detect silent disconnections
         self._connection_watchdog_task = self._loop.create_task(self._connection_watchdog())
         
-        # Query configuration
-        self._enqueue_source_label_query_commands()
-        self._enqueue_zone_label_query_commands()
-        self._enqueue_zone_line_input_enable_query_commands()
-        self._enqueue_group_status_query_commands()
-        self._enqueue_group_label_query_commands()
-        self._enqueue_group_line_input_enable_query_commands()
+        # Query configuration — only on initial connect.
+        # On reconnect, skip these to preserve cached labels/line inputs; if the device
+        # is slow to respond it may return empty/default values and overwrite good names.
+        if not lost_timestamp:
+            self._enqueue_source_label_query_commands()
+            self._enqueue_zone_label_query_commands()
+            self._enqueue_zone_line_input_enable_query_commands()
+            self._enqueue_group_status_query_commands()
+            self._enqueue_group_label_query_commands()
+            self._enqueue_group_line_input_enable_query_commands()
+        else:
+            self._logger.info(
+                "Reconnect: skipping installation config queries, retaining cached labels and line inputs"
+            )
 
         # Query operational status
         self._enqueue_zone_source_query_commands()
@@ -962,6 +1012,7 @@ class DCM1Mixer:
         self._enqueue_zone_eq_query_commands()
         self._enqueue_group_source_query_commands()
         self._enqueue_group_volume_level_query_commands()
+        self._enqueue_command(MixerProtocol.command_query_paging_status(), PRIORITY_READ)
 
     def _on_disconnected(self):
         """Called by MixerListener when connection is lost."""
@@ -1010,6 +1061,11 @@ class DCM1Mixer:
         """Get the volume level for a group."""
         group = self._get_group_by_id(group_id)
         return group.volume if group else None
+
+    @property
+    def paging_status(self) -> Optional[str]:
+        """Current paging mask, e.g. 'XOOOOOOO' means zone 1 is paging."""
+        return self._paging_status
 
     def register_listener(self, listener):
         """Register external listener for mixer events."""
@@ -1096,6 +1152,137 @@ class DCM1Mixer:
         if group:
             group.set_volume(level)  # Group validates level
 
+    async def _async_paging_open(self, mask: str) -> None:
+        """Send paging open command and confirm via state query."""
+        if (task := self._paging_confirm_task) and not task.done():
+            task.cancel()
+            self._paging_confirm_task = None
+
+        self._enqueue_command(MixerProtocol.command_paging_open(mask), PRIORITY_WRITE)
+
+        if self._command_confirmation:
+            self._paging_confirm_task = self._loop.create_task(self._confirm_paging(mask))
+            try:
+                await self._paging_confirm_task
+            except asyncio.CancelledError:
+                self._logger.debug("Paging confirmation cancelled (superseded by new command)")
+
+    async def start_zone_paging(self, zone_id: int) -> None:
+        """Open (activate) paging on a specific zone.
+
+        This method is async and waits for confirmation from the device.
+
+        Args:
+            zone_id: Zone number (1-8)
+        """
+        if not (1 <= zone_id <= self._zone_count):
+            self._logger.error(
+                f"Invalid zone_id {zone_id} for paging, must be 1-{self._zone_count}"
+            )
+            return
+        
+        # Create 8-char mask 'OOOOOOOO' and set 'X' at the zone_id position
+        mask_list = ["O"] * self._zone_count
+        mask_list[zone_id - 1] = "X"
+        mask = "".join(mask_list)
+
+        self._logger.info(f"Opening paging on zone {zone_id} (mask: {mask})")
+        await self._async_paging_open(mask)
+
+    async def start_group_paging(self, group_id: int) -> None:
+        """Open paging on all zones that are members of a group.
+
+        The DCM1 has no native group-level paging concept, so this sends
+        a single '<PM,PAXXXXXXXX/>' command with a combined mask for all
+        zones in the group.
+
+        Args:
+            group_id: Group number (1-4)
+        """
+        group = self._get_group_by_id(group_id)
+        if not group:
+            return
+        if not group.zones:
+            self._logger.warning(
+                f"Group {group_id} has no member zones — paging not sent"
+            )
+            return
+
+        # Create 8-char mask 'OOOOOOOO' and set 'X' for each zone in the group
+        mask_list = ["O"] * self._zone_count
+        for zone_id in group.zones:
+            if 1 <= zone_id <= self._zone_count:
+                mask_list[zone_id - 1] = "X"
+        
+        mask = "".join(mask_list)
+        self._logger.info(f"Opening paging on group {group_id} (mask: {mask})")
+        await self._async_paging_open(mask)
+
+    async def start_paging_with_mask(self, mask: str) -> None:
+        """Open paging on an arbitrary combination of zones.
+
+        Args:
+            mask: 8-character string of 'X' (active) and 'O' (inactive),
+                  e.g. 'XOXOOOOO' opens zones 1 and 3.
+        """
+        mask = mask.upper()
+        if len(mask) != self._zone_count or not all(c in "XO" for c in mask):
+            self._logger.error(
+                f"Invalid paging mask '{mask}': must be {self._zone_count} X/O characters"
+            )
+            return
+        if "X" not in mask:
+            self._logger.error("Paging mask has no active zones — ignoring")
+            return
+        self._logger.info(f"Opening paging with mask: {mask}")
+        await self._async_paging_open(mask)
+
+    async def stop_all_paging(self) -> None:
+        """Switch all paging off (Paging Release).
+
+        Sends '<PM,PR/>' immediately at write priority and confirms via state query.
+        """
+        self._logger.info("Stopping all paging")
+
+        if (task := self._paging_confirm_task) and not task.done():
+            task.cancel()
+            self._paging_confirm_task = None
+
+        self._enqueue_command(MixerProtocol.command_paging_close_all(), PRIORITY_WRITE)
+
+        if self._command_confirmation:
+            self._paging_confirm_task = self._loop.create_task(self._confirm_paging("OOOOOOOO"))
+            try:
+                await self._paging_confirm_task
+            except asyncio.CancelledError:
+                self._logger.debug("Paging stop confirmation cancelled")
+
+    async def _confirm_paging(self, expected_mask: str):
+        """Confirm paging state matches expected_mask by querying device."""
+        await asyncio.sleep(0.3)
+        self._enqueue_command(MixerProtocol.command_query_paging_status(), PRIORITY_READ)
+        await asyncio.sleep(0.5)
+
+        # TODO: Unlike volume/source, a paging mask mismatch after confirmation is ambiguous:
+        # it could be a genuine send failure (command lost → retry is correct), or it could
+        # mean another source (physical mic, SD card) has opened the bus (→ retrying would
+        # override an active external page, which is wrong).  To distinguish these cases we
+        # would need a timestamp of when _paging_status was last updated so we can tell
+        # whether the query response we just read arrived *after* our command was sent (real
+        # failure) or was already stale before we even sent (pre-existing external page).
+        # Until that timestamp is available, retrying on mismatch is the status quo but may
+        # stomp on legitimate external paging activity.
+        if self._paging_status != expected_mask:
+            for seq_num in sorted(self._inflight_commands.keys(), reverse=True):
+                _, msg = self._inflight_commands[seq_num]
+                if MixerProtocol.command_paging_pattern() in msg:
+                    self._reenqueue_inflight_command(seq_num)
+                    break
+        else:
+            self._clear_latest_inflight_command_by_pattern(
+                MixerProtocol.command_paging_pattern()
+            )
+
     # ========== Helpers  ==========
 
     def _get_zone_by_id(self, zone_id: int) -> Optional[Zone]:
@@ -1123,7 +1310,7 @@ class DCM1Mixer:
             return
         self._queued_commands_set.add(msg_key)
         # Safety: make sure the command worker is alive
-        if self._command_worker_task is None or self._command_worker_task.done():
+        if (task := self._command_worker_task) is None or task.done():
             self._logger.warning("Command worker was not running; restarting it")
             self._command_worker_task = self._loop.create_task(self._command_worker())
         try:
@@ -1226,6 +1413,13 @@ class DCM1Mixer:
                     self._pending_heartbeat_queries.add(group_volume_query)
                     await self._command_queue.put((PRIORITY_READ, self._command_sequence_number, (group_volume_query, None)))
 
+            # Query paging status
+            paging_query = MixerProtocol.command_query_paging_status()
+            if paging_query not in self._pending_heartbeat_queries:
+                self._command_sequence_number += 1
+                self._pending_heartbeat_queries.add(paging_query)
+                await self._command_queue.put((PRIORITY_READ, self._command_sequence_number, (paging_query, None)))
+
     # ========== Connection management ==========
 
     async def _connection_watchdog(self):
@@ -1269,32 +1463,52 @@ class DCM1Mixer:
         self._connected = False
         self._connection_lost_timestamp = time.time()
         
-        if self._heartbeat_task is not None:
-            self._heartbeat_task.cancel()
-        if self._command_worker_task is not None:
-            self._command_worker_task.cancel()
+        if (task := self._heartbeat_task) and not task.done():
+            task.cancel()
+        self._heartbeat_task = None
+        if (task := self._command_worker_task) and not task.done():
+            task.cancel()
+        self._command_worker_task = None
         
+        # Cancel paging confirmation if pending
+        if (task := self._paging_confirm_task) and not task.done():
+            task.cancel()
+        self._paging_confirm_task = None
+
         # Cancel confirmation tasks in zone and group objects
         for zone in self.zones_by_id.values():
-            if zone._source_confirm_task and not zone._source_confirm_task.done():
-                zone._source_confirm_task.cancel()
-            if zone._volume_confirm_task and not zone._volume_confirm_task.done():
-                zone._volume_confirm_task.cancel()
-            if zone._eq_treble_confirm_task and not zone._eq_treble_confirm_task.done():
-                zone._eq_treble_confirm_task.cancel()
-            if zone._eq_mid_confirm_task and not zone._eq_mid_confirm_task.done():
-                zone._eq_mid_confirm_task.cancel()
-            if zone._eq_bass_confirm_task and not zone._eq_bass_confirm_task.done():
-                zone._eq_bass_confirm_task.cancel()
+            if (task := zone._source_confirm_task) and not task.done():
+                task.cancel()
+            zone._source_confirm_task = None
+
+            if (task := zone._volume_confirm_task) and not task.done():
+                task.cancel()
+            zone._volume_confirm_task = None
+
+            if (task := zone._eq_treble_confirm_task) and not task.done():
+                task.cancel()
+            zone._eq_treble_confirm_task = None
+
+            if (task := zone._eq_mid_confirm_task) and not task.done():
+                task.cancel()
+            zone._eq_mid_confirm_task = None
+
+            if (task := zone._eq_bass_confirm_task) and not task.done():
+                task.cancel()
+            zone._eq_bass_confirm_task = None
         
         for group in self.groups_by_id.values():
-            if group._source_confirm_task and not group._source_confirm_task.done():
-                group._source_confirm_task.cancel()
-            if group._volume_confirm_task and not group._volume_confirm_task.done():
-                group._volume_confirm_task.cancel()
+            if (task := group._source_confirm_task) and not task.done():
+                task.cancel()
+            group._source_confirm_task = None
+
+            if (task := group._volume_confirm_task) and not task.done():
+                task.cancel()
+            group._volume_confirm_task = None
         
-        if self._connection_watchdog_task is not None:
-            self._connection_watchdog_task.cancel()
+        if (task := self._connection_watchdog_task) and not task.done():
+            task.cancel()
+        self._connection_watchdog_task = None
         
         disconnected_message = f"Disconnected from {self._hostname}"
         if self._reconnect:
@@ -1315,7 +1529,7 @@ class DCM1Mixer:
             _, message = self._inflight_commands[sequence_number]
             if pattern in message:
                 self._logger.debug(f"Clearing confirmed inflight send: Command #{sequence_number} matching {pattern}")
-                del self._inflight_commands[sequence_number]
+                self._inflight_commands.pop(sequence_number, None)
                 return
 
     def _reenqueue_inflight_command(self, sequence_number: int) -> bool:
@@ -1360,6 +1574,8 @@ class DCM1Mixer:
             pattern = MixerProtocol.command_source_pattern(OutputType.GROUP, group_src_id)
         elif group_vol_id is not None:
             pattern = MixerProtocol.command_volume_pattern(OutputType.GROUP, group_vol_id)
+        elif MixerProtocol.command_paging_pattern() in message:
+            pattern = MixerProtocol.command_paging_pattern()
         else:
             return
         
@@ -1374,7 +1590,7 @@ class DCM1Mixer:
                 self._logger.debug(f"Removing superseded inflight command: #{old_sequence_number} (newer #{sequence_number} replaces it for {pattern})")
         
         for old_sequence_number in to_remove:
-            del self._inflight_commands[old_sequence_number]
+            self._inflight_commands.pop(old_sequence_number, None)
 
     # ========== Query commands ==========
 
